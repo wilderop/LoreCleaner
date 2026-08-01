@@ -1,0 +1,19 @@
+name: LoreCleaner
+version: ${project.version}
+main: com.wilder0p.lorecleaner.LoreCleanerPlugin
+api-version: '26.2'
+authors: [wilder0p]
+description: Moves lore items from players offline for 6+ months into barrels at their last logout location.
+website: https://github.com/wilderop/LoreCleaner
+
+commands:
+  lorecleaner:
+    description: Main command for LoreCleaner
+    usage: /lorecleaner <force|status|reload>
+    aliases: [lc]
+    permission: lorecleaner.admin
+
+permissions:
+  lorecleaner.admin:
+    description: Allows use of LoreCleaner admin commands
+    default: op

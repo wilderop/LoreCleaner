@@ -1,0 +1,34 @@
+# LoreCleaner Configuration
+# =========================
+
+# How many days a player must be offline before their lore items are moved
+inactive-days: 180
+
+# Grace period after the plugin is first enabled (in days).
+# During this period the plugin will not process any players.
+grace-period-days: 30
+
+# How many hours must pass after a successful full run before the next scan is allowed
+cooldown-after-full-run-hours: 72
+
+# How many continuous minutes TPS must be at ~20.0 before processing is allowed to start
+tps-stable-minutes: 5
+
+# Maximum number of players to process per minute while TPS stays good
+players-per-minute: 4
+
+# Re-check interval: after a player has been cleaned, wait this many days of continued
+# inactivity before cleaning them again
+recheck-days: 180
+
+# Discord webhook URL (leave empty to disable)
+# Never includes coordinates
+discord-webhook-url: ""
+
+# Messages
+messages:
+  cleaned-on-login: "<yellow>While you were offline for more than 6 months, your lore items were moved into a barrel at your last logout location."
+  barrel-sign-line1: "LoreCleaner"
+  barrel-sign-line2: "%player%"
+  barrel-sign-line3: "%date%"
+  barrel-sign-line4: ""
