@@ -20,6 +20,7 @@ Implements the policy announced by wilder0p:
 - **Discord webhook** (no coordinates ever sent)
 - **Login message** to the player the next time they join
 - **OP commands**: `/lorecleaner force|status|reload`
+- **Safe offline handling**: scan-then-commit, atomic `.dat` writes with `.bak` backup, never touches online players
 
 ## Requirements
 
@@ -67,6 +68,4 @@ Permission: `lorecleaner.admin` (default: op)
 
 The server has existed since 1.14. Some `.dat` files may be corrupted or use very old formats. Those are automatically skipped and written to `plugins/LoreCleaner/logs/failed-loads.log` so you can inspect them later.
 
-## Important note on item conversion
-
-The offline playerdata reader uses reflection against Paper's NBT classes. On first test you may need a small adjustment to `OfflinePlayerData.nbtToItemStack` depending on the exact 26.2 build mappings. The rest of the plugin is pure Paper API.
+Item conversion uses `ItemStack.parseOptional` (with a CODEC fallback) so both pre-1.20.5 `tag` format and modern data-component items are handled.
