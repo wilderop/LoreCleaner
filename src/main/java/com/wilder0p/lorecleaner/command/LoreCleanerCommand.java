@@ -97,13 +97,31 @@ public class LoreCleanerCommand implements CommandExecutor, TabCompleter {
     }
 
     private void handleDry(CommandSender sender, String[] args) {
+        if (args.length < 2) {
+            sender.sendMessage(Component.text("Usage: /lorecleaner dry <months> [limit]", NamedTextColor.RED));
+            sender.sendMessage(Component.text("Example: /lorecleaner dry 6 50  — 6-month cutoff, max 50 files", NamedTextColor.GRAY));
+            sender.sendMessage(Component.text("Skips players already scanned at current lastPlayed. No barrels / no .dat writes.", NamedTextColor.GRAY));
+            return;
+        }
+
+        int months;
+        try {
+            months = Integer.parseInt(args[1]);
+        } catch (NumberFormatException e) {
+            sender.sendMessage(Component.text("Months must be a whole number (e.g. 6).", NamedTextColor.RED));
+            return;
+        }
+        if (months < 1) {
+            sender.sendMessage(Component.text("Months must be >= 1.", NamedTextColor.RED));
+            return;
+        }
+
         int limit = 0;
-        if (args.length >= 2) {
+        if (args.length >= 3) {
             try {
-                limit = Integer.parseInt(args[1]);
+                limit = Integer.parseInt(args[2]);
             } catch (NumberFormatException e) {
-                sender.sendMessage(Component.text("Usage: /lorecleaner dry [limit]", NamedTextColor.RED));
-                sender.sendMessage(Component.text("Example: /lorecleaner dry 50", NamedTextColor.GRAY));
+                sender.sendMessage(Component.text("Limit must be a whole number (e.g. 50).", NamedTextColor.RED));
                 return;
             }
             if (limit < 1) {
@@ -111,14 +129,15 @@ public class LoreCleanerCommand implements CommandExecutor, TabCompleter {
                 return;
             }
         }
-        plugin.getCleanerManager().startDryRun(sender, limit);
+
+        plugin.getCleanerManager().startDryRun(sender, months, limit);
     }
 
     private void sendHelp(CommandSender sender) {
         sender.sendMessage(Component.text("LoreCleaner commands:", NamedTextColor.GOLD));
         sender.sendMessage(Component.text("/lorecleaner force                 — Force a live cleaning cycle", NamedTextColor.YELLOW));
-        sender.sendMessage(Component.text("/lorecleaner dry [limit]           — Dry-run; skips unchanged no-lore files", NamedTextColor.YELLOW));
-        sender.sendMessage(Component.text("  Uses config inactive-days. No barrels / no .dat writes.", NamedTextColor.GRAY));
+        sender.sendMessage(Component.text("/lorecleaner dry <months> [limit]  — Dry-run; skips unchanged no-lore files", NamedTextColor.YELLOW));
+        sender.sendMessage(Component.text("  e.g. /lorecleaner dry 6 50       — no barrels / no .dat writes", NamedTextColor.GRAY));
         sender.sendMessage(Component.text("/lorecleaner test <months> [limit] — Full diagnostic (rescans everyone)", NamedTextColor.YELLOW));
         sender.sendMessage(Component.text("/lorecleaner status                — Show current state", NamedTextColor.YELLOW));
         sender.sendMessage(Component.text("/lorecleaner reload                — Reload config.yml", NamedTextColor.YELLOW));
@@ -158,18 +177,13 @@ public class LoreCleanerCommand implements CommandExecutor, TabCompleter {
                     .filter(s -> s.startsWith(args[0].toLowerCase()))
                     .toList();
         }
-        if (args.length == 2 && args[0].equalsIgnoreCase("test")) {
+        if (args.length == 2 && (args[0].equalsIgnoreCase("test") || args[0].equalsIgnoreCase("dry"))) {
             return Stream.of("1", "3", "6", "12")
                     .filter(s -> s.startsWith(args[1]))
                     .toList();
         }
-        if (args.length == 2 && args[0].equalsIgnoreCase("dry")) {
-            return Stream.of("10", "25", "50", "100", "500")
-                    .filter(s -> s.startsWith(args[1]))
-                    .toList();
-        }
-        if (args.length == 3 && args[0].equalsIgnoreCase("test")) {
-            return Stream.of("5", "10", "25", "50", "100")
+        if (args.length == 3 && (args[0].equalsIgnoreCase("test") || args[0].equalsIgnoreCase("dry"))) {
+            return Stream.of("5", "10", "25", "50", "100", "500")
                     .filter(s -> s.startsWith(args[2]))
                     .toList();
         }
