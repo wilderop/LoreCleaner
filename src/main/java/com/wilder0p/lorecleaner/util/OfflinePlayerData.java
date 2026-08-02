@@ -20,26 +20,14 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.logging.Level;
 
-/**
- * Safe offline playerdata reader/writer for Paper 26.2.
- *
- * Design goals:
- * - Never mutate the on-disk .dat until we are ready to commit
- * - Atomic write (temp file + rename) with a .bak backup
- * - Survive both pre-1.20.5 (tag) and post-1.20.5 (components) item formats
- * - Survive old 1.14-era playerdata via the server's DataFixer when possible
- */
 public class OfflinePlayerData {
 
     private final LoreCleanerPlugin plugin;
     private final UUID uuid;
     private final File datFile;
 
-    /** net.minecraft.nbt.CompoundTag — the live in-memory root */
     private Object rootCompound;
     private boolean dirty = false;
-
-    /** True if any item failed NBT→ItemStack conversion (so we do NOT mark the player cleaned). */
     private boolean hadConversionFailures = false;
 
     private OfflinePlayerData(LoreCleanerPlugin plugin, UUID uuid, File datFile, Object rootCompound) {
@@ -49,24 +37,106 @@ public class OfflinePlayerData {
         this.rootCompound = rootCompound;
     }
 
-    public static OfflinePlayerData load(LoreCleanerPlugin plugin, UUID uuid) {
-        World world = Bukkit.getWorlds().isEmpty() ? null : Bukkit.getWorlds().get(0);
-        if (world == null) return null;
+    private static volatile boolean loggedFirstReadError = false;
+    private static volatile boolean loggedPathDiagnostic = false;
 
-        File playerDataDir = new File(world.getWorldFolder(), "playerdata");
-        File datFile = new File(playerDataDir, uuid.toString() + ".dat");
-        if (!datFile.exists()) {
-            return null;
+    public enum LoadStatus {
+        OK,
+        FILE_MISSING,
+        READ_ERROR
+    }
+
+    public static final class LoadResult {
+        public final OfflinePlayerData data;
+        public final LoadStatus status;
+        public final String detail;
+
+        private LoadResult(OfflinePlayerData data, LoadStatus status, String detail) {
+            this.data = data;
+            this.status = status;
+            this.detail = detail;
+        }
+
+        public static LoadResult ok(OfflinePlayerData data) {
+            return new LoadResult(data, LoadStatus.OK, null);
+        }
+
+        public static LoadResult missing(String detail) {
+            return new LoadResult(null, LoadStatus.FILE_MISSING, detail);
+        }
+
+        public static LoadResult error(String detail) {
+            return new LoadResult(null, LoadStatus.READ_ERROR, detail);
+        }
+    }
+
+    public static OfflinePlayerData load(LoreCleanerPlugin plugin, UUID uuid) {
+        return loadDetailed(plugin, uuid).data;
+    }
+
+    public static LoadResult loadDetailed(LoreCleanerPlugin plugin, UUID uuid) {
+        File datFile = findPlayerDat(uuid);
+        if (datFile == null) {
+            logPathDiagnosticOnce(plugin);
+            return LoadResult.missing("no " + uuid + ".dat under any world/playerdata");
         }
 
         try {
             Object compound = readCompressed(datFile);
-            if (compound == null) return null;
-            return new OfflinePlayerData(plugin, uuid, datFile, compound);
+            if (compound == null) {
+                return LoadResult.error("readCompressed returned null for " + datFile.getAbsolutePath());
+            }
+            return LoadResult.ok(new OfflinePlayerData(plugin, uuid, datFile, compound));
         } catch (Exception e) {
-            plugin.getLogger().log(Level.WARNING, "Failed to read playerdata for " + uuid, e);
-            return null;
+            if (!loggedFirstReadError) {
+                loggedFirstReadError = true;
+                plugin.getLogger().log(Level.SEVERE,
+                        "FIRST playerdata read failure (further failures will be quiet). "
+                                + "File: " + datFile.getAbsolutePath()
+                                + " size=" + datFile.length() + "B",
+                        e);
+            }
+            return LoadResult.error(e.getClass().getSimpleName() + ": " + e.getMessage()
+                    + " @ " + datFile.getAbsolutePath());
         }
+    }
+
+    public static File findPlayerDat(UUID uuid) {
+        String name = uuid.toString() + ".dat";
+
+        for (World world : Bukkit.getWorlds()) {
+            File f = new File(new File(world.getWorldFolder(), "playerdata"), name);
+            if (f.isFile()) return f;
+        }
+
+        File container = Bukkit.getWorldContainer();
+        File[] children = container.listFiles();
+        if (children != null) {
+            for (File worldFolder : children) {
+                if (!worldFolder.isDirectory()) continue;
+                File f = new File(new File(worldFolder, "playerdata"), name);
+                if (f.isFile()) return f;
+            }
+        }
+        return null;
+    }
+
+    private static void logPathDiagnosticOnce(LoreCleanerPlugin plugin) {
+        if (loggedPathDiagnostic) return;
+        loggedPathDiagnostic = true;
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("playerdata path diagnostic (logged once):\n");
+        for (World world : Bukkit.getWorlds()) {
+            File dir = new File(world.getWorldFolder(), "playerdata");
+            File[] files = dir.isDirectory() ? dir.listFiles((d, n) -> n.endsWith(".dat")) : null;
+            int count = files == null ? 0 : files.length;
+            sb.append("  world '").append(world.getName()).append("' -> ")
+                    .append(dir.getAbsolutePath())
+                    .append(" exists=").append(dir.isDirectory())
+                    .append(" datCount=").append(count).append('\n');
+        }
+        plugin.getLogger().warning(sb.toString());
     }
 
     public boolean hadConversionFailures() {
@@ -242,10 +312,17 @@ public class OfflinePlayerData {
         Method unlimitedHeap = nbtAccounter.getMethod("unlimitedHeap");
         Object accounter = unlimitedHeap.invoke(null);
 
-        Method readCompressed = nbtIo.getMethod("readCompressed",
+        try {
+            Method readPath = nbtIo.getMethod("readCompressed",
+                    java.nio.file.Path.class, nbtAccounter);
+            return readPath.invoke(null, file.toPath(), accounter);
+        } catch (NoSuchMethodException ignored) {
+        }
+
+        Method readStream = nbtIo.getMethod("readCompressed",
                 java.io.InputStream.class, nbtAccounter);
         try (FileInputStream fis = new FileInputStream(file)) {
-            return readCompressed.invoke(null, fis, accounter);
+            return readStream.invoke(null, fis, accounter);
         }
     }
 
