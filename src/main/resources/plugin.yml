@@ -9,7 +9,7 @@ website: https://github.com/wilderop/LoreCleaner
 commands:
   lorecleaner:
     description: Main command for LoreCleaner
-    usage: /lorecleaner <force|dry [limit]|test <months> [limit]|status|reload>
+    usage: /lorecleaner <force|dry <months> [limit]|test <months> [limit]|status|reload>
     aliases: [lc]
     permission: lorecleaner.admin
 
