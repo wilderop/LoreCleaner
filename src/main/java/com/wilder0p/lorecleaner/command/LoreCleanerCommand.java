@@ -52,6 +52,7 @@ public class LoreCleanerCommand implements CommandExecutor, TabCompleter {
                 sender.sendMessage(Component.text("Config reloaded.", NamedTextColor.GREEN));
             }
             case "test" -> handleTest(sender, args);
+            case "dry" -> handleDry(sender, args);
             default -> sendHelp(sender);
         }
         return true;
@@ -61,7 +62,7 @@ public class LoreCleanerCommand implements CommandExecutor, TabCompleter {
         if (args.length < 2) {
             sender.sendMessage(Component.text("Usage: /lorecleaner test <months> [limit]", NamedTextColor.RED));
             sender.sendMessage(Component.text("Example: /lorecleaner test 6 10  — 6-month cutoff, only first 10 files", NamedTextColor.GRAY));
-            sender.sendMessage(Component.text("Omit limit to scan every eligible offline player.", NamedTextColor.GRAY));
+            sender.sendMessage(Component.text("Full diagnostic — rescans everyone, ignores prior scan snapshots.", NamedTextColor.GRAY));
             return;
         }
 
@@ -78,7 +79,7 @@ public class LoreCleanerCommand implements CommandExecutor, TabCompleter {
             return;
         }
 
-        int limit = 0; // 0 = no limit
+        int limit = 0;
         if (args.length >= 3) {
             try {
                 limit = Integer.parseInt(args[2]);
@@ -95,13 +96,32 @@ public class LoreCleanerCommand implements CommandExecutor, TabCompleter {
         plugin.getCleanerManager().startTestRun(sender, months, limit);
     }
 
+    private void handleDry(CommandSender sender, String[] args) {
+        int limit = 0;
+        if (args.length >= 2) {
+            try {
+                limit = Integer.parseInt(args[1]);
+            } catch (NumberFormatException e) {
+                sender.sendMessage(Component.text("Usage: /lorecleaner dry [limit]", NamedTextColor.RED));
+                sender.sendMessage(Component.text("Example: /lorecleaner dry 50", NamedTextColor.GRAY));
+                return;
+            }
+            if (limit < 1) {
+                sender.sendMessage(Component.text("Limit must be >= 1 (or omit it for no limit).", NamedTextColor.RED));
+                return;
+            }
+        }
+        plugin.getCleanerManager().startDryRun(sender, limit);
+    }
+
     private void sendHelp(CommandSender sender) {
         sender.sendMessage(Component.text("LoreCleaner commands:", NamedTextColor.GOLD));
-        sender.sendMessage(Component.text("/lorecleaner force              — Force a cleaning cycle", NamedTextColor.YELLOW));
-        sender.sendMessage(Component.text("/lorecleaner test <months> [limit] — Dry-run; optional file limit", NamedTextColor.YELLOW));
-        sender.sendMessage(Component.text("  e.g. /lorecleaner test 6 10    — 6 months, only 10 files", NamedTextColor.GRAY));
-        sender.sendMessage(Component.text("/lorecleaner status             — Show current state", NamedTextColor.YELLOW));
-        sender.sendMessage(Component.text("/lorecleaner reload             — Reload config.yml", NamedTextColor.YELLOW));
+        sender.sendMessage(Component.text("/lorecleaner force                 — Force a live cleaning cycle", NamedTextColor.YELLOW));
+        sender.sendMessage(Component.text("/lorecleaner dry [limit]           — Dry-run; skips unchanged no-lore files", NamedTextColor.YELLOW));
+        sender.sendMessage(Component.text("  Uses config inactive-days. No barrels / no .dat writes.", NamedTextColor.GRAY));
+        sender.sendMessage(Component.text("/lorecleaner test <months> [limit] — Full diagnostic (rescans everyone)", NamedTextColor.YELLOW));
+        sender.sendMessage(Component.text("/lorecleaner status                — Show current state", NamedTextColor.YELLOW));
+        sender.sendMessage(Component.text("/lorecleaner reload                — Reload config.yml", NamedTextColor.YELLOW));
     }
 
     private void sendStatus(CommandSender sender) {
@@ -134,12 +154,17 @@ public class LoreCleanerCommand implements CommandExecutor, TabCompleter {
     public @Nullable List<String> onTabComplete(@NotNull CommandSender sender, @NotNull Command command,
                                                 @NotNull String alias, @NotNull String[] args) {
         if (args.length == 1) {
-            return Stream.of("force", "test", "status", "reload")
+            return Stream.of("force", "dry", "test", "status", "reload")
                     .filter(s -> s.startsWith(args[0].toLowerCase()))
                     .toList();
         }
         if (args.length == 2 && args[0].equalsIgnoreCase("test")) {
             return Stream.of("1", "3", "6", "12")
+                    .filter(s -> s.startsWith(args[1]))
+                    .toList();
+        }
+        if (args.length == 2 && args[0].equalsIgnoreCase("dry")) {
+            return Stream.of("10", "25", "50", "100", "500")
                     .filter(s -> s.startsWith(args[1]))
                     .toList();
         }
