@@ -23,12 +23,15 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 
-/** Dry-run and full diagnostic (test) scans. Never modifies playerdata or places blocks. */
+/**
+ * Dry-run and full diagnostic (test) scans. Never modifies playerdata or places blocks.
+ */
 public class ScanService {
 
     private final LoreCleanerPlugin plugin;
     private final CleanerManager cleaner;
     private final File logDir;
+
     private BukkitTask scanTask;
 
     private static final DateTimeFormatter FILE_TS = DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss")
@@ -47,6 +50,10 @@ public class ScanService {
         }
     }
 
+    /**
+     * Dry-run: skips players already scanned at current lastPlayed.
+     * Zero-lore → markScanned. Lore hits → report only (live clean still processes them).
+     */
     public void startDryRun(CommandSender sender, int months, int limit) {
         if (cleaner.isTestRunning()) {
             sender.sendMessage(Component.text("A test/dry scan is already running. Wait for it to finish.", NamedTextColor.RED));
@@ -61,27 +68,49 @@ public class ScanService {
             return;
         }
 
-        DataManager dataMgr = plugin.getDataManager();
-        long inactiveMs = months * 30L * 86400L * 1000L;
-        long now = System.currentTimeMillis();
+        cleaner.setTestRunning(true);
+        sender.sendMessage(Component.text(
+                "Building dry-run list async (" + months + " months) — avoids main-thread .dat reads...",
+                NamedTextColor.GRAY));
 
-        List<OfflinePlayerCandidate> candidates = new ArrayList<>();
-        int skippedUnchanged = 0;
-        for (OfflinePlayer offline : Bukkit.getOfflinePlayers()) {
-            if (offline.getUniqueId() == null) continue;
-            if (offline.isOnline()) continue;
-            long lastPlayed = offline.getLastPlayed();
-            if (lastPlayed <= 0) continue;
-            if (now - lastPlayed < inactiveMs) continue;
-            if (dataMgr.wasScannedAtLastPlayed(offline.getUniqueId(), lastPlayed)) {
-                skippedUnchanged++;
-                continue;
+        Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+            DataManager dataMgr = plugin.getDataManager();
+            long inactiveMs = months * 30L * 86400L * 1000L;
+            long now = System.currentTimeMillis();
+
+            List<OfflinePlayerCandidate> candidates = new ArrayList<>();
+            int skippedUnchanged = 0;
+            for (OfflinePlayer offline : Bukkit.getOfflinePlayers()) {
+                if (offline.getUniqueId() == null) continue;
+                if (offline.isOnline()) continue;
+                long lastPlayed;
+                try {
+                    lastPlayed = offline.getLastPlayed();
+                } catch (Exception e) {
+                    continue;
+                }
+                if (lastPlayed <= 0) continue;
+                if (now - lastPlayed < inactiveMs) continue;
+                if (dataMgr.wasScannedAtLastPlayed(offline.getUniqueId(), lastPlayed)) {
+                    skippedUnchanged++;
+                    continue;
+                }
+                candidates.add(new OfflinePlayerCandidate(offline.getUniqueId(), lastPlayed));
             }
-            candidates.add(new OfflinePlayerCandidate(offline.getUniqueId(), lastPlayed));
-        }
-        candidates.sort(Comparator.comparingLong(c -> c.lastPlayed));
+            candidates.sort(Comparator.comparingLong(c -> c.lastPlayed));
 
+            final int skippedSnapshot = skippedUnchanged;
+            final List<OfflinePlayerCandidate> built = candidates;
+
+            Bukkit.getScheduler().runTask(plugin, () ->
+                    continueDryRun(sender, months, limit, built, skippedSnapshot, now));
+        });
+    }
+
+    private void continueDryRun(CommandSender sender, int months, int limit,
+                                List<OfflinePlayerCandidate> candidates, int skippedUnchanged, long now) {
         if (candidates.isEmpty()) {
+            cleaner.setTestRunning(false);
             sender.sendMessage(Component.text(
                     "Nothing to dry-scan for " + months + "+ months. All eligible were already scanned at current lastPlayed"
                             + " (skipped unchanged: " + skippedUnchanged + ").",
@@ -89,13 +118,13 @@ public class ScanService {
             return;
         }
 
+        DataManager dataMgr = plugin.getDataManager();
         final int eligibleNew = candidates.size();
         final List<OfflinePlayerCandidate> toScan = applyLimit(candidates, limit);
 
         String stamp = FILE_TS.format(Instant.now());
         File dryLog = new File(logDir, "dry-" + stamp + ".log");
 
-        cleaner.setTestRunning(true);
         sender.sendMessage(Component.text(
                 "Starting dry-run for " + months + " months inactivity cutoff. No files or blocks will be modified.",
                 NamedTextColor.GREEN));
@@ -253,6 +282,9 @@ public class ScanService {
         plugin.getLogger().info("Dry-run finished → " + dryLog.getName());
     }
 
+    /**
+     * Full diagnostic: ignores prior scan snapshots. Does not markScanned.
+     */
     public void startTestRun(CommandSender sender, int months, int limit) {
         if (cleaner.isTestRunning()) {
             sender.sendMessage(Component.text("A test/dry scan is already running. Wait for it to finish.", NamedTextColor.RED));
@@ -263,21 +295,41 @@ public class ScanService {
             return;
         }
 
-        long inactiveMs = months * 30L * 86400L * 1000L;
-        long now = System.currentTimeMillis();
+        cleaner.setTestRunning(true);
+        sender.sendMessage(Component.text(
+                "Building test candidate list async (" + months + " months) — avoids main-thread .dat reads...",
+                NamedTextColor.GRAY));
 
-        List<OfflinePlayerCandidate> candidates = new ArrayList<>();
-        for (OfflinePlayer offline : Bukkit.getOfflinePlayers()) {
-            if (offline.getUniqueId() == null) continue;
-            if (offline.isOnline()) continue;
-            long lastPlayed = offline.getLastPlayed();
-            if (lastPlayed <= 0) continue;
-            if (now - lastPlayed < inactiveMs) continue;
-            candidates.add(new OfflinePlayerCandidate(offline.getUniqueId(), lastPlayed));
-        }
-        candidates.sort(Comparator.comparingLong(c -> c.lastPlayed));
+        Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+            long inactiveMs = months * 30L * 86400L * 1000L;
+            long now = System.currentTimeMillis();
 
+            List<OfflinePlayerCandidate> candidates = new ArrayList<>();
+            for (OfflinePlayer offline : Bukkit.getOfflinePlayers()) {
+                if (offline.getUniqueId() == null) continue;
+                if (offline.isOnline()) continue;
+                long lastPlayed;
+                try {
+                    lastPlayed = offline.getLastPlayed();
+                } catch (Exception e) {
+                    continue;
+                }
+                if (lastPlayed <= 0) continue;
+                if (now - lastPlayed < inactiveMs) continue;
+                candidates.add(new OfflinePlayerCandidate(offline.getUniqueId(), lastPlayed));
+            }
+            candidates.sort(Comparator.comparingLong(c -> c.lastPlayed));
+
+            final List<OfflinePlayerCandidate> built = candidates;
+            Bukkit.getScheduler().runTask(plugin, () ->
+                    continueTestRun(sender, months, limit, built, now));
+        });
+    }
+
+    private void continueTestRun(CommandSender sender, int months, int limit,
+                                 List<OfflinePlayerCandidate> candidates, long now) {
         if (candidates.isEmpty()) {
+            cleaner.setTestRunning(false);
             sender.sendMessage(Component.text(
                     "No offline players found inactive for " + months + "+ months.", NamedTextColor.YELLOW));
             return;
@@ -297,7 +349,6 @@ public class ScanService {
                     + (probe == null ? "NOT FOUND" : probe.getAbsolutePath()));
         }
 
-        cleaner.setTestRunning(true);
         sender.sendMessage(Component.text(
                 "Starting dry-run test for " + months + " months inactivity cutoff.", NamedTextColor.GREEN));
         if (limit > 0) {
