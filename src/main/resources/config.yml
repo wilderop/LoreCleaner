@@ -8,17 +8,18 @@ inactive-days: 180
 # During this period the plugin will not process any players.
 grace-period-days: 30
 
-# How many hours must pass after a successful full run before the next scan is allowed
+# How many days must pass after a successful full run before the next scan is allowed
 cooldown-after-full-run-hours: 72
 
-# How many continuous minutes TPS must be at ~20.0 before processing is allowed to start
+# How many continuous minutes TPS must be exactly 20.0 before processing is allowed to start
 tps-stable-minutes: 5
 
-# Maximum number of players to process per minute while TPS stays good
+# Maximum number of players to process per minute while TPS stays at 20.0
+# (helps spread disk I/O and CPU)
 players-per-minute: 4
 
 # Re-check interval: after a player has been cleaned, wait this many days of continued
-# inactivity before cleaning them again
+# inactivity before cleaning them again (in case they accumulate new lore items)
 recheck-days: 180
 
 # Discord webhook URL (leave empty to disable)
@@ -32,3 +33,7 @@ messages:
   barrel-sign-line2: "%player%"
   barrel-sign-line3: "%date%"
   barrel-sign-line4: ""
+
+# Advanced
+# Only process players whose lastPlayed is older than inactive-days
+# and who have not been cleaned within the recheck-days window.
