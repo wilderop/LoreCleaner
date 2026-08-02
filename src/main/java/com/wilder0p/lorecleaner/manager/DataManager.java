@@ -25,6 +25,16 @@ public class DataManager {
     private final Map<UUID, Instant> lastCleaned = new HashMap<>();
     private final Map<UUID, Boolean> pendingLoginMessage = new HashMap<>();
 
+    /**
+     * UUID → OfflinePlayer.getLastPlayed() value at the time we last successfully
+     * scanned their .dat. If current lastPlayed still equals this, the file has not
+     * changed (player has not logged in), so we can skip re-reading it.
+     */
+    private final Map<UUID, Long> scannedLastPlayed = new HashMap<>();
+
+    private boolean dirty = false;
+    private int unsavedMarks = 0;
+
     private static final DateTimeFormatter FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
             .withZone(ZoneId.systemDefault());
 
@@ -78,6 +88,18 @@ public class DataManager {
                 } catch (Exception ignored) {}
             }
         }
+
+        if (data.isConfigurationSection("scanned-last-played")) {
+            for (String key : data.getConfigurationSection("scanned-last-played").getKeys(false)) {
+                try {
+                    UUID uuid = UUID.fromString(key);
+                    long lp = data.getLong("scanned-last-played." + key);
+                    scannedLastPlayed.put(uuid, lp);
+                } catch (Exception e) {
+                    plugin.getLogger().warning("Invalid scanned-last-played entry: " + key);
+                }
+            }
+        }
     }
 
     public void save() {
@@ -95,11 +117,21 @@ public class DataManager {
             }
         }
 
+        for (Map.Entry<UUID, Long> entry : scannedLastPlayed.entrySet()) {
+            data.set("scanned-last-played." + entry.getKey().toString(), entry.getValue());
+        }
+
         try {
             data.save(dataFile);
+            dirty = false;
+            unsavedMarks = 0;
         } catch (IOException e) {
             plugin.getLogger().log(Level.SEVERE, "Could not save data.yml", e);
         }
+    }
+
+    public void saveIfDirty() {
+        if (dirty) save();
     }
 
     public Instant getFirstEnabled() {
@@ -120,6 +152,7 @@ public class DataManager {
 
     public void setLastFullRunCompleted(Instant time) {
         this.lastFullRunCompleted = time;
+        dirty = true;
         save();
     }
 
@@ -127,10 +160,39 @@ public class DataManager {
         return lastCleaned.get(uuid);
     }
 
+    public boolean wasScannedAtLastPlayed(UUID uuid, long currentLastPlayed) {
+        Long stored = scannedLastPlayed.get(uuid);
+        return stored != null && stored == currentLastPlayed;
+    }
+
+    public void markScanned(UUID uuid, long lastPlayed) {
+        scannedLastPlayed.put(uuid, lastPlayed);
+        dirty = true;
+        unsavedMarks++;
+        if (unsavedMarks >= 50) {
+            save();
+        }
+    }
+
     public void markCleaned(UUID uuid) {
         lastCleaned.put(uuid, Instant.now());
         pendingLoginMessage.put(uuid, true);
-        save();
+        dirty = true;
+        unsavedMarks++;
+        if (unsavedMarks >= 50) {
+            save();
+        }
+    }
+
+    public void markCleanedAndScanned(UUID uuid, long lastPlayed) {
+        lastCleaned.put(uuid, Instant.now());
+        pendingLoginMessage.put(uuid, true);
+        scannedLastPlayed.put(uuid, lastPlayed);
+        dirty = true;
+        unsavedMarks++;
+        if (unsavedMarks >= 50) {
+            save();
+        }
     }
 
     public boolean hasPendingLoginMessage(UUID uuid) {
@@ -139,7 +201,12 @@ public class DataManager {
 
     public void clearPendingLoginMessage(UUID uuid) {
         pendingLoginMessage.remove(uuid);
+        dirty = true;
         save();
+    }
+
+    public int getScannedSnapshotCount() {
+        return scannedLastPlayed.size();
     }
 
     public String format(Instant instant) {
