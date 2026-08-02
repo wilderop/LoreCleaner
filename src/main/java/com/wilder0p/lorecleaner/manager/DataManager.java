@@ -130,6 +130,7 @@ public class DataManager {
         }
     }
 
+    /** Persist if there are pending in-memory changes. */
     public void saveIfDirty() {
         if (dirty) save();
     }
@@ -160,11 +161,19 @@ public class DataManager {
         return lastCleaned.get(uuid);
     }
 
+    /**
+     * True if we already scanned this player while their lastPlayed was this value.
+     * Means they have not logged in since, so the .dat is unchanged — safe to skip.
+     */
     public boolean wasScannedAtLastPlayed(UUID uuid, long currentLastPlayed) {
         Long stored = scannedLastPlayed.get(uuid);
         return stored != null && stored == currentLastPlayed;
     }
 
+    /**
+     * Record that we successfully read this player's .dat while lastPlayed was this value.
+     * Batches disk writes (flushes every 50 marks).
+     */
     public void markScanned(UUID uuid, long lastPlayed) {
         scannedLastPlayed.put(uuid, lastPlayed);
         dirty = true;
@@ -184,6 +193,10 @@ public class DataManager {
         }
     }
 
+    /**
+     * After a successful clean (items moved), record both cleaned time and the
+     * lastPlayed we scanned under so we do not immediately re-open the same file.
+     */
     public void markCleanedAndScanned(UUID uuid, long lastPlayed) {
         lastCleaned.put(uuid, Instant.now());
         pendingLoginMessage.put(uuid, true);
