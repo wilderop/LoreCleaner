@@ -78,7 +78,7 @@ public class OfflinePlayerData {
         File datFile = findPlayerDat(uuid);
         if (datFile == null) {
             logPathDiagnosticOnce(plugin);
-            return LoadResult.missing("no " + uuid + ".dat under any world/playerdata");
+            return LoadResult.missing("no " + uuid + ".dat under players/data or playerdata");
         }
 
         try {
@@ -101,12 +101,17 @@ public class OfflinePlayerData {
         }
     }
 
+    private static final String[] PLAYERDATA_SUBDIRS = {
+            "players/data",
+            "playerdata"
+    };
+
     public static File findPlayerDat(UUID uuid) {
         String name = uuid.toString() + ".dat";
 
         for (World world : Bukkit.getWorlds()) {
-            File f = new File(new File(world.getWorldFolder(), "playerdata"), name);
-            if (f.isFile()) return f;
+            File found = findInWorldFolder(world.getWorldFolder(), name);
+            if (found != null) return found;
         }
 
         File container = Bukkit.getWorldContainer();
@@ -114,9 +119,17 @@ public class OfflinePlayerData {
         if (children != null) {
             for (File worldFolder : children) {
                 if (!worldFolder.isDirectory()) continue;
-                File f = new File(new File(worldFolder, "playerdata"), name);
-                if (f.isFile()) return f;
+                File found = findInWorldFolder(worldFolder, name);
+                if (found != null) return found;
             }
+        }
+        return null;
+    }
+
+    private static File findInWorldFolder(File worldFolder, String datName) {
+        for (String sub : PLAYERDATA_SUBDIRS) {
+            File f = new File(new File(worldFolder, sub), datName);
+            if (f.isFile()) return f;
         }
         return null;
     }
@@ -128,13 +141,17 @@ public class OfflinePlayerData {
         StringBuilder sb = new StringBuilder();
         sb.append("playerdata path diagnostic (logged once):\n");
         for (World world : Bukkit.getWorlds()) {
-            File dir = new File(world.getWorldFolder(), "playerdata");
-            File[] files = dir.isDirectory() ? dir.listFiles((d, n) -> n.endsWith(".dat")) : null;
-            int count = files == null ? 0 : files.length;
-            sb.append("  world '").append(world.getName()).append("' -> ")
-                    .append(dir.getAbsolutePath())
-                    .append(" exists=").append(dir.isDirectory())
-                    .append(" datCount=").append(count).append('\n');
+            for (String sub : PLAYERDATA_SUBDIRS) {
+                File dir = new File(world.getWorldFolder(), sub);
+                File[] files = dir.isDirectory()
+                        ? dir.listFiles((d, n) -> n.endsWith(".dat") && !n.endsWith(".dat_old"))
+                        : null;
+                int count = files == null ? 0 : files.length;
+                sb.append("  world '").append(world.getName()).append("' /").append(sub)
+                        .append(" -> ").append(dir.getAbsolutePath())
+                        .append(" exists=").append(dir.isDirectory())
+                        .append(" datCount=").append(count).append('\n');
+            }
         }
         plugin.getLogger().warning(sb.toString());
     }
