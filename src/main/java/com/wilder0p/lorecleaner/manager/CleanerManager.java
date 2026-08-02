@@ -196,11 +196,12 @@ public class CleanerManager {
         org.bukkit.OfflinePlayer offline = Bukkit.getOfflinePlayer(uuid);
         String name = offline.getName() != null ? offline.getName() : uuid.toString();
 
-        OfflinePlayerData data = OfflinePlayerData.load(plugin, uuid);
-        if (data == null) {
-            logFailed(uuid, "Could not load playerdata .dat (corrupted or missing)");
+        OfflinePlayerData.LoadResult loaded = OfflinePlayerData.loadDetailed(plugin, uuid);
+        if (loaded.data == null) {
+            logFailed(uuid, loaded.status + ": " + loaded.detail);
             return;
         }
+        OfflinePlayerData data = loaded.data;
 
         List<ItemStack> scanned = data.scanLoreItems();
 
@@ -403,7 +404,10 @@ public class CleanerManager {
         return processedThisCycle;
     }
 
-    public void startTestRun(CommandSender sender, int months) {
+    /**
+     * @param limit max players to scan (oldest offline first). 0 = no limit.
+     */
+    public void startTestRun(CommandSender sender, int months, int limit) {
         if (testRunning) {
             sender.sendMessage(Component.text("A test scan is already running. Wait for it to finish.", NamedTextColor.RED));
             return;
@@ -432,20 +436,59 @@ public class CleanerManager {
             return;
         }
 
+        final int eligibleTotal = candidates.size();
+        final List<OfflinePlayerCandidate> toScan;
+        if (limit > 0 && candidates.size() > limit) {
+            toScan = new ArrayList<>(candidates.subList(0, limit));
+        } else {
+            toScan = candidates;
+        }
+
         String stamp = FILE_TS.format(Instant.now());
         File testLog = new File(logDir, "test-" + stamp + ".log");
 
+        int datOnDisk = 0;
+        String[] subdirs = {"players/data", "playerdata"};
+        for (org.bukkit.World w : Bukkit.getWorlds()) {
+            for (String sub : subdirs) {
+                File dir = new File(w.getWorldFolder(), sub);
+                File[] files = dir.isDirectory()
+                        ? dir.listFiles((d, n) -> n.endsWith(".dat") && !n.endsWith(".dat_old"))
+                        : null;
+                if (files != null) datOnDisk += files.length;
+            }
+        }
+
         testRunning = true;
         sender.sendMessage(Component.text("Starting dry-run test for " + months + " months inactivity cutoff.", NamedTextColor.GREEN));
-        sender.sendMessage(Component.text("Eligible offline players: " + candidates.size() + " — writing to logs/" + testLog.getName(), NamedTextColor.GRAY));
+        if (limit > 0) {
+            sender.sendMessage(Component.text(
+                    "Eligible offline: " + eligibleTotal
+                            + " | scanning first " + toScan.size() + " (oldest offline first)"
+                            + " | .dat on disk: " + datOnDisk
+                            + " — logs/" + testLog.getName(),
+                    NamedTextColor.GRAY));
+        } else {
+            sender.sendMessage(Component.text(
+                    "Eligible offline (usercache): " + eligibleTotal
+                            + " | .dat files on disk (all worlds): " + datOnDisk
+                            + " — writing to logs/" + testLog.getName(),
+                    NamedTextColor.GRAY));
+        }
         sender.sendMessage(Component.text("Progress updates every minute. This does NOT move any items.", NamedTextColor.GRAY));
+        if (datOnDisk == 0) {
+            sender.sendMessage(Component.text(
+                    "WARNING: 0 .dat files found under players/data or playerdata — check world folder paths.",
+                    NamedTextColor.RED));
+        }
 
-        final int total = candidates.size();
+        final int total = toScan.size();
         final int[] index = {0};
         final int[] playersWithItems = {0};
         final int[] playersWithZeroLore = {0};
         final int[] totalLoreItems = {0};
         final int[] failedLoads = {0};
+        final int[] missingFiles = {0};
         final long startMs = System.currentTimeMillis();
         final long[] lastProgressMs = {startMs};
 
@@ -453,7 +496,12 @@ public class CleanerManager {
             header.println("LoreCleaner dry-run test");
             header.println("Started: " + plugin.getDataManager().format(Instant.now()));
             header.println("Inactivity cutoff: " + months + " month(s) (~" + (months * 30) + " days)");
-            header.println("Eligible offline players to scan: " + total);
+            header.println("Eligible offline (usercache matching cutoff): " + eligibleTotal);
+            if (limit > 0) {
+                header.println("Scan limit: " + limit + " (oldest offline first) — actually scanning: " + total);
+            } else {
+                header.println("Scan limit: none — scanning all " + total);
+            }
             header.println("NOTE: This is a dry run. No items were moved. No playerdata was modified.");
             header.println("NOTE: Players with 0 lore items are counted in the summary only (not listed).");
             header.println("========================================================================");
@@ -478,6 +526,7 @@ public class CleanerManager {
                     out.println("  Players scanned:              " + total);
                     out.println("  Players with lore items:      " + playersWithItems[0] + "  (detailed above)");
                     out.println("  Players with zero lore items: " + playersWithZeroLore[0] + "  (not listed individually)");
+                    out.println("  Missing .dat on disk:         " + missingFiles[0] + "  (usercache entry, no file)");
                     out.println("  Total lore items found:       " + totalLoreItems[0]);
                     out.println("  Failed/unreadable loads:      " + failedLoads[0]);
                     out.println("  Elapsed:                      " + elapsedSec + "s");
@@ -488,9 +537,10 @@ public class CleanerManager {
                 sender.sendMessage(Component.text(
                         "Scanned " + total
                                 + " | with lore: " + playersWithItems[0]
-                                + " | zero lore (omitted): " + playersWithZeroLore[0]
-                                + " | items: " + totalLoreItems[0]
-                                + " | failed: " + failedLoads[0],
+                                + " | zero lore: " + playersWithZeroLore[0]
+                                + " | missing .dat: " + missingFiles[0]
+                                + " | read errors: " + failedLoads[0]
+                                + " | items: " + totalLoreItems[0],
                         NamedTextColor.WHITE));
                 sender.sendMessage(Component.text("Report: plugins/LoreCleaner/logs/" + testLog.getName(), NamedTextColor.GRAY));
                 plugin.getLogger().info("Test scan finished → " + testLog.getName());
@@ -507,7 +557,7 @@ public class CleanerManager {
                         NamedTextColor.YELLOW));
             }
 
-            OfflinePlayerCandidate c = candidates.get(index[0]++);
+            OfflinePlayerCandidate c = toScan.get(index[0]++);
             OfflinePlayer offline = Bukkit.getOfflinePlayer(c.uuid);
             if (offline.isOnline()) {
                 return;
@@ -517,20 +567,26 @@ public class CleanerManager {
             long daysAgo = Math.max(0, (now - c.lastPlayed) / 86400_000L);
             String lastPlayedStr = plugin.getDataManager().format(Instant.ofEpochMilli(c.lastPlayed));
 
-            OfflinePlayerData data = OfflinePlayerData.load(plugin, c.uuid);
-            if (data == null) {
-                failedLoads[0]++;
-                appendTestLine(testLog, String.format(
-                        "[%s] %s (%s)%n  Last played: %s (%d days ago)%n  ERROR: could not load playerdata%n",
-                        plugin.getDataManager().format(Instant.now()), name, c.uuid, lastPlayedStr, daysAgo));
+            OfflinePlayerData.LoadResult loaded = OfflinePlayerData.loadDetailed(plugin, c.uuid);
+            if (loaded.data == null) {
+                if (loaded.status == OfflinePlayerData.LoadStatus.FILE_MISSING) {
+                    missingFiles[0]++;
+                } else {
+                    failedLoads[0]++;
+                    if (failedLoads[0] <= 50) {
+                        appendTestLine(testLog, String.format(
+                                "[%s] %s (%s)%n  Last played: %s (%d days ago)%n  READ ERROR: %s%n",
+                                plugin.getDataManager().format(Instant.now()), name, c.uuid,
+                                lastPlayedStr, daysAgo, loaded.detail));
+                    }
+                }
                 return;
             }
+            OfflinePlayerData data = loaded.data;
 
             List<ItemStack> loreItems = data.scanLoreItems();
 
             if (loreItems.isEmpty()) {
-                // Do not spam the log with thousands of empty players — count only.
-                // Still log a short entry if conversion partially failed so we can investigate.
                 if (data.hadConversionFailures()) {
                     failedLoads[0]++;
                     appendTestLine(testLog, String.format(
