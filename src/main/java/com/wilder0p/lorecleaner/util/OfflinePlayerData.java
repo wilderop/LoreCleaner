@@ -20,14 +20,26 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.logging.Level;
 
+/**
+ * Safe offline playerdata reader/writer for Paper 26.2.
+ *
+ * Design goals:
+ * - Never mutate the on-disk .dat until we are ready to commit
+ * - Atomic write (temp file + rename) with a .bak backup
+ * - Survive both pre-1.20.5 (tag) and post-1.20.5 (components) item formats
+ * - Survive old 1.14-era playerdata via the server's DataFixer when possible
+ */
 public class OfflinePlayerData {
 
     private final LoreCleanerPlugin plugin;
     private final UUID uuid;
     private final File datFile;
 
+    /** net.minecraft.nbt.CompoundTag — the live in-memory root */
     private Object rootCompound;
     private boolean dirty = false;
+
+    /** True if any item failed NBT→ItemStack conversion (so we do NOT mark the player cleaned). */
     private boolean hadConversionFailures = false;
 
     private OfflinePlayerData(LoreCleanerPlugin plugin, UUID uuid, File datFile, Object rootCompound) {
@@ -37,6 +49,7 @@ public class OfflinePlayerData {
         this.rootCompound = rootCompound;
     }
 
+    /** Set on the first read failure so we only spam the console once. */
     private static volatile boolean loggedFirstReadError = false;
     private static volatile boolean loggedPathDiagnostic = false;
 
@@ -78,7 +91,7 @@ public class OfflinePlayerData {
         File datFile = findPlayerDat(uuid);
         if (datFile == null) {
             logPathDiagnosticOnce(plugin);
-            return LoadResult.missing("no " + uuid + ".dat under players/data or playerdata");
+            return LoadResult.missing("no " + uuid + ".dat under any world/playerdata");
         }
 
         try {
@@ -449,16 +462,21 @@ public class OfflinePlayerData {
                     Class.forName("com.mojang.serialization.DynamicOps"), Object.class);
             Object dataResult = parse.invoke(codec, context, itemCompound);
 
-            Object nmsStack;
+            Method resultOrPartial = null;
             try {
-                Method resultOrPartial = dataResult.getClass().getMethod("resultOrPartial");
+                resultOrPartial = dataResult.getClass().getMethod("resultOrPartial");
+            } catch (NoSuchMethodException e) {
+            }
+
+            Object nmsStack;
+            if (resultOrPartial != null) {
                 Object opt = resultOrPartial.invoke(dataResult);
                 if (opt instanceof Optional<?> o) {
                     nmsStack = o.orElse(null);
                 } else {
                     nmsStack = opt;
                 }
-            } catch (NoSuchMethodException e) {
+            } else {
                 Method getOrThrow = dataResult.getClass().getMethod("getOrThrow");
                 nmsStack = getOrThrow.invoke(dataResult);
             }
