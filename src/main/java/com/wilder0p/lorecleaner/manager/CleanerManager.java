@@ -43,6 +43,7 @@ public class CleanerManager {
     private boolean forceRun = false;
     private boolean currentlyProcessing = false;
     private boolean testRunning = false;
+    private boolean buildingQueue = false;
     private int processedThisCycle = 0;
 
     private final File logDir;
@@ -68,6 +69,7 @@ public class CleanerManager {
         if (processTask != null) processTask.cancel();
         scanService.shutdown();
         testRunning = false;
+        buildingQueue = false;
     }
 
     public boolean isTestRunning() {
@@ -94,7 +96,7 @@ public class CleanerManager {
     }
 
     private void decisionTick() {
-        if (currentlyProcessing) return;
+        if (currentlyProcessing || buildingQueue) return;
 
         DataManager data = plugin.getDataManager();
         ConfigManager cfg = plugin.getConfigManager();
@@ -116,20 +118,39 @@ public class CleanerManager {
         }
 
         if (processQueue.isEmpty()) {
-            buildQueue();
-            if (processQueue.isEmpty()) {
-                if (forceRun) {
-                    forceRun = false;
-                    plugin.getLogger().info("Force run finished — no eligible players found.");
-                }
-                return;
-            }
-            plugin.getLogger().info(
-                    "Built processing queue with " + processQueue.size() + " eligible offline players (oldest first).");
+            buildingQueue = true;
+            plugin.getLogger().info("Building clean queue asynchronously (avoids main-thread .dat reads)...");
+            Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+                List<UUID> built = buildQueueAsync();
+                Bukkit.getScheduler().runTask(plugin, () -> {
+                    buildingQueue = false;
+                    processQueue.clear();
+                    processQueue.addAll(built);
+                    if (processQueue.isEmpty()) {
+                        if (forceRun) {
+                            forceRun = false;
+                            plugin.getLogger().info("Force run finished — no eligible players found.");
+                        }
+                        return;
+                    }
+                    plugin.getLogger().info(
+                            "Built processing queue with " + processQueue.size()
+                                    + " eligible offline players (oldest first).");
+                    startProcessing();
+                });
+            });
+            return;
         }
 
+        startProcessing();
+    }
+
+    private void startProcessing() {
+        if (currentlyProcessing) return;
         currentlyProcessing = true;
         processedThisCycle = 0;
+        ConfigManager cfg = plugin.getConfigManager();
+        DataManager data = plugin.getDataManager();
         int delayTicks = Math.max(1, 1200 / Math.max(1, cfg.getPlayersPerMinute()));
 
         processTask = Bukkit.getScheduler().runTaskTimer(plugin, () -> {
@@ -165,8 +186,7 @@ public class CleanerManager {
         }, 1L, delayTicks);
     }
 
-    private void buildQueue() {
-        processQueue.clear();
+    private List<UUID> buildQueueAsync() {
         ConfigManager cfg = plugin.getConfigManager();
         DataManager data = plugin.getDataManager();
 
@@ -176,11 +196,17 @@ public class CleanerManager {
 
         List<OfflinePlayerCandidate> candidates = new ArrayList<>();
 
-        for (OfflinePlayer offline : Bukkit.getOfflinePlayers()) {
+        OfflinePlayer[] offlinePlayers = Bukkit.getOfflinePlayers();
+        for (OfflinePlayer offline : offlinePlayers) {
             if (offline.getUniqueId() == null) continue;
             if (offline.isOnline()) continue;
 
-            long lastPlayed = offline.getLastPlayed();
+            long lastPlayed;
+            try {
+                lastPlayed = offline.getLastPlayed();
+            } catch (Exception e) {
+                continue;
+            }
             if (lastPlayed <= 0) continue;
             if (now - lastPlayed < inactiveMs) continue;
 
@@ -198,9 +224,11 @@ public class CleanerManager {
         }
 
         candidates.sort(Comparator.comparingLong(c -> c.lastPlayed));
+        List<UUID> result = new ArrayList<>(candidates.size());
         for (OfflinePlayerCandidate c : candidates) {
-            processQueue.add(c.uuid);
+            result.add(c.uuid);
         }
+        return result;
     }
 
     private void processPlayer(UUID uuid) {
