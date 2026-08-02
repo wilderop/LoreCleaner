@@ -3,17 +3,23 @@ package com.wilder0p.lorecleaner.manager;
 import com.wilder0p.lorecleaner.LoreCleanerPlugin;
 import com.wilder0p.lorecleaner.util.OfflinePlayerData;
 import com.wilder0p.lorecleaner.util.DiscordWebhook;
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.format.NamedTextColor;
+import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.Material;
+import org.bukkit.OfflinePlayer;
 import org.bukkit.World;
 import org.bukkit.block.Block;
 import org.bukkit.block.BlockFace;
 import org.bukkit.block.Sign;
 import org.bukkit.block.data.BlockData;
 import org.bukkit.block.data.type.WallSign;
+import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
 import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.scheduler.BukkitTask;
 
 import java.io.File;
@@ -21,6 +27,8 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -32,29 +40,41 @@ public class CleanerManager {
     private final Queue<UUID> processQueue = new ConcurrentLinkedQueue<>();
     private BukkitTask scanTask;
     private BukkitTask processTask;
+    private BukkitTask testTask;
     private boolean forceRun = false;
     private boolean currentlyProcessing = false;
+    private boolean testRunning = false;
     private int processedThisCycle = 0;
 
+    private final File logDir;
     private final File cleanLogFile;
     private final File failedLogFile;
 
+    private static final DateTimeFormatter FILE_TS = DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss")
+            .withZone(ZoneId.systemDefault());
+    private static final PlainTextComponentSerializer PLAIN = PlainTextComponentSerializer.plainText();
+
     public CleanerManager(LoreCleanerPlugin plugin) {
         this.plugin = plugin;
-        File logDir = new File(plugin.getDataFolder(), "logs");
+        this.logDir = new File(plugin.getDataFolder(), "logs");
         if (!logDir.exists()) logDir.mkdirs();
         this.cleanLogFile = new File(logDir, "cleaned.log");
         this.failedLogFile = new File(logDir, "failed-loads.log");
     }
 
     public void start() {
-        // Main decision loop every 30 seconds
         scanTask = Bukkit.getScheduler().runTaskTimer(plugin, this::decisionTick, 100L, 600L);
     }
 
     public void shutdown() {
         if (scanTask != null) scanTask.cancel();
         if (processTask != null) processTask.cancel();
+        if (testTask != null) testTask.cancel();
+        testRunning = false;
+    }
+
+    public boolean isTestRunning() {
+        return testRunning;
     }
 
     public void forceRun() {
@@ -85,11 +105,9 @@ public class CleanerManager {
             return;
         }
 
-        // Build or rebuild queue if empty
         if (processQueue.isEmpty()) {
             buildQueue();
             if (processQueue.isEmpty()) {
-                // Nothing to do
                 if (forceRun) {
                     forceRun = false;
                     plugin.getLogger().info("Force run finished — no eligible players found.");
@@ -99,20 +117,17 @@ public class CleanerManager {
             plugin.getLogger().info("Built processing queue with " + processQueue.size() + " eligible offline players (oldest first).");
         }
 
-        // Start processing loop
         currentlyProcessing = true;
         processedThisCycle = 0;
-        int delayTicks = Math.max(1, 1200 / Math.max(1, cfg.getPlayersPerMinute())); // ticks between players
+        int delayTicks = Math.max(1, 1200 / Math.max(1, cfg.getPlayersPerMinute()));
 
         processTask = Bukkit.getScheduler().runTaskTimer(plugin, () -> {
             if (!forceRun && !plugin.getTpsMonitor().isStable()) {
-                // TPS dropped — pause
                 return;
             }
 
             UUID next = processQueue.poll();
             if (next == null) {
-                // Queue empty — full run complete
                 processTask.cancel();
                 currentlyProcessing = false;
                 forceRun = false;
@@ -122,7 +137,6 @@ public class CleanerManager {
                 return;
             }
 
-            // Skip if player is now online
             Player online = Bukkit.getPlayer(next);
             if (online != null && online.isOnline()) {
                 return;
@@ -154,7 +168,7 @@ public class CleanerManager {
             if (offline.isOnline()) continue;
 
             long lastPlayed = offline.getLastPlayed();
-            if (lastPlayed <= 0) continue; // never played or invalid
+            if (lastPlayed <= 0) continue;
 
             if (now - lastPlayed < inactiveMs) continue;
 
@@ -167,7 +181,6 @@ public class CleanerManager {
             candidates.add(new OfflinePlayerCandidate(offline.getUniqueId(), lastPlayed));
         }
 
-        // Oldest first
         candidates.sort(Comparator.comparingLong(c -> c.lastPlayed));
 
         for (OfflinePlayerCandidate c : candidates) {
@@ -176,7 +189,6 @@ public class CleanerManager {
     }
 
     private void processPlayer(UUID uuid) {
-        // Abort immediately if the player came online between queue poll and now
         if (Bukkit.getPlayer(uuid) != null) {
             return;
         }
@@ -190,11 +202,9 @@ public class CleanerManager {
             return;
         }
 
-        // ---- Phase 1: scan only (no mutation of NBT) ----
         List<ItemStack> scanned = data.scanLoreItems();
 
         if (scanned.isEmpty()) {
-            // Only mark cleaned if conversion fully succeeded (no unreadable items left behind)
             if (!data.hadConversionFailures()) {
                 plugin.getDataManager().markCleaned(uuid);
             } else {
@@ -215,42 +225,32 @@ public class CleanerManager {
             return;
         }
 
-        // ---- Phase 2: player still offline? ----
         if (Bukkit.getPlayer(uuid) != null) {
-            return; // they logged in; leave .dat alone
+            return;
         }
 
-        // ---- Phase 3: mutate NBT + place barrels + atomic save ----
         List<ItemStack> loreItems = data.extractAndRemoveLoreItems();
         if (loreItems.isEmpty()) {
-            // Race or conversion flake — nothing to place
             return;
         }
 
         int barrelsPlaced = placeBarrelsWithItems(placeLoc, loreItems, name);
 
-        // Final online check before writing the .dat
         if (Bukkit.getPlayer(uuid) != null) {
-            // Player logged in mid-process. Barrels are already in the world (duplication risk
-            // is better than deleting items from a live session). Do NOT save the mutated NBT.
             logFailed(uuid, "Player logged in during processing — barrels placed but playerdata NOT modified");
             return;
         }
 
         try {
-            data.save(); // atomic write + .bak
+            data.save();
         } catch (Exception e) {
-            // Barrels exist in world; playerdata still has the items → duplication, not loss
             logFailed(uuid, "playerdata save failed after barrel placement: " + e.getMessage());
             return;
         }
 
-        // Only mark cleaned when we successfully committed
         if (!data.hadConversionFailures()) {
             plugin.getDataManager().markCleaned(uuid);
         } else {
-            // Some items could not be converted and were left in the .dat.
-            // Do not mark cleaned so a future run (after a plugin fix) can retry.
             plugin.getLogger().warning("Player " + name + " had some unreadable items; not marking fully cleaned.");
         }
 
@@ -269,17 +269,15 @@ public class CleanerManager {
         World world = origin.getWorld();
         if (world == null) return null;
 
-        // Check origin first
         if (isValidPlacement(origin.getBlock())) {
             return origin.getBlock().getLocation();
         }
 
-        // Spiral search for air
         int maxRadius = 8;
         for (int r = 1; r <= maxRadius; r++) {
             for (int x = -r; x <= r; x++) {
                 for (int z = -r; z <= r; z++) {
-                    if (Math.abs(x) != r && Math.abs(z) != r) continue; // only perimeter
+                    if (Math.abs(x) != r && Math.abs(z) != r) continue;
                     for (int y = -2; y <= 2; y++) {
                         Block b = world.getBlockAt(origin.getBlockX() + x, origin.getBlockY() + y, origin.getBlockZ() + z);
                         if (isValidPlacement(b)) {
@@ -293,7 +291,6 @@ public class CleanerManager {
     }
 
     private boolean isValidPlacement(Block block) {
-        // Prefer true air; never replace solid blocks
         if (block.getType() != Material.AIR) return false;
         return block.getWorld().getWorldBorder().isInside(block.getLocation());
     }
@@ -303,13 +300,11 @@ public class CleanerManager {
         int index = 0;
         Location current = start.clone();
 
-        // Offsets to try when the next spot is blocked (east, west, south, north, up)
         int[][] offsets = {{1, 0, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}, {0, 1, 0}};
 
         while (index < items.size()) {
             Block block = current.getBlock();
             if (!isValidPlacement(block)) {
-                // Search nearby for another free air block
                 Location found = null;
                 outer:
                 for (int r = 1; r <= 4; r++) {
@@ -345,7 +340,6 @@ public class CleanerManager {
             placeSignOnBarrel(block, playerName);
 
             barrels++;
-            // Prefer next spot one block east of this barrel
             current = block.getLocation().add(1, 0, 0);
         }
         return barrels;
@@ -355,7 +349,6 @@ public class CleanerManager {
         ConfigManager cfg = plugin.getConfigManager();
         String date = plugin.getDataManager().format(Instant.now());
 
-        // Prefer south face, then others
         BlockFace[] faces = {BlockFace.SOUTH, BlockFace.NORTH, BlockFace.EAST, BlockFace.WEST};
         for (BlockFace face : faces) {
             Block signBlock = barrelBlock.getRelative(face);
@@ -408,6 +401,218 @@ public class CleanerManager {
 
     public int getProcessedThisCycle() {
         return processedThisCycle;
+    }
+
+    public void startTestRun(CommandSender sender, int months) {
+        if (testRunning) {
+            sender.sendMessage(Component.text("A test scan is already running. Wait for it to finish.", NamedTextColor.RED));
+            return;
+        }
+        if (months < 1) {
+            sender.sendMessage(Component.text("Months must be a whole number >= 1.", NamedTextColor.RED));
+            return;
+        }
+
+        long inactiveMs = months * 30L * 86400L * 1000L;
+        long now = System.currentTimeMillis();
+
+        List<OfflinePlayerCandidate> candidates = new ArrayList<>();
+        for (OfflinePlayer offline : Bukkit.getOfflinePlayers()) {
+            if (offline.getUniqueId() == null) continue;
+            if (offline.isOnline()) continue;
+            long lastPlayed = offline.getLastPlayed();
+            if (lastPlayed <= 0) continue;
+            if (now - lastPlayed < inactiveMs) continue;
+            candidates.add(new OfflinePlayerCandidate(offline.getUniqueId(), lastPlayed));
+        }
+        candidates.sort(Comparator.comparingLong(c -> c.lastPlayed));
+
+        if (candidates.isEmpty()) {
+            sender.sendMessage(Component.text("No offline players found inactive for " + months + "+ months.", NamedTextColor.YELLOW));
+            return;
+        }
+
+        String stamp = FILE_TS.format(Instant.now());
+        File testLog = new File(logDir, "test-" + stamp + ".log");
+
+        testRunning = true;
+        sender.sendMessage(Component.text("Starting dry-run test for " + months + " months inactivity cutoff.", NamedTextColor.GREEN));
+        sender.sendMessage(Component.text("Eligible offline players: " + candidates.size() + " — writing to logs/" + testLog.getName(), NamedTextColor.GRAY));
+        sender.sendMessage(Component.text("Progress updates every minute. This does NOT move any items.", NamedTextColor.GRAY));
+
+        final int total = candidates.size();
+        final int[] index = {0};
+        final int[] playersWithItems = {0};
+        final int[] totalLoreItems = {0};
+        final int[] failedLoads = {0};
+        final long startMs = System.currentTimeMillis();
+        final long[] lastProgressMs = {startMs};
+
+        try (PrintWriter header = new PrintWriter(new FileWriter(testLog, false))) {
+            header.println("LoreCleaner dry-run test");
+            header.println("Started: " + plugin.getDataManager().format(Instant.now()));
+            header.println("Inactivity cutoff: " + months + " month(s) (~" + (months * 30) + " days)");
+            header.println("Eligible offline players to scan: " + total);
+            header.println("NOTE: This is a dry run. No items were moved. No playerdata was modified.");
+            header.println("========================================================================");
+            header.println();
+        } catch (IOException e) {
+            sender.sendMessage(Component.text("Could not create test log file: " + e.getMessage(), NamedTextColor.RED));
+            testRunning = false;
+            return;
+        }
+
+        testTask = Bukkit.getScheduler().runTaskTimer(plugin, () -> {
+            if (index[0] >= total) {
+                testTask.cancel();
+                testTask = null;
+                testRunning = false;
+
+                long elapsedSec = Math.max(1, (System.currentTimeMillis() - startMs) / 1000);
+                try (PrintWriter out = new PrintWriter(new FileWriter(testLog, true))) {
+                    out.println();
+                    out.println("========================================================================");
+                    out.println("SUMMARY");
+                    out.println("  Players scanned:           " + total);
+                    out.println("  Players with lore items:   " + playersWithItems[0]);
+                    out.println("  Total lore items found:    " + totalLoreItems[0]);
+                    out.println("  Failed/unreadable loads:   " + failedLoads[0]);
+                    out.println("  Elapsed:                   " + elapsedSec + "s");
+                    out.println("Finished: " + plugin.getDataManager().format(Instant.now()));
+                } catch (IOException ignored) {}
+
+                sender.sendMessage(Component.text("Test complete.", NamedTextColor.GREEN));
+                sender.sendMessage(Component.text(
+                        "Scanned " + total + " | with lore: " + playersWithItems[0]
+                                + " | items: " + totalLoreItems[0]
+                                + " | failed loads: " + failedLoads[0],
+                        NamedTextColor.WHITE));
+                sender.sendMessage(Component.text("Report: plugins/LoreCleaner/logs/" + testLog.getName(), NamedTextColor.GRAY));
+                plugin.getLogger().info("Test scan finished → " + testLog.getName());
+                return;
+            }
+
+            long nowMs = System.currentTimeMillis();
+            if (nowMs - lastProgressMs[0] >= 60_000L) {
+                lastProgressMs[0] = nowMs;
+                int pct = (index[0] * 100) / Math.max(1, total);
+                sender.sendMessage(Component.text(
+                        "Test progress: " + index[0] + "/" + total + " (" + pct + "%) — "
+                                + playersWithItems[0] + " players with lore so far",
+                        NamedTextColor.YELLOW));
+            }
+
+            OfflinePlayerCandidate c = candidates.get(index[0]++);
+            OfflinePlayer offline = Bukkit.getOfflinePlayer(c.uuid);
+            if (offline.isOnline()) {
+                return;
+            }
+
+            String name = offline.getName() != null ? offline.getName() : c.uuid.toString();
+            long daysAgo = Math.max(0, (now - c.lastPlayed) / 86400_000L);
+            String lastPlayedStr = plugin.getDataManager().format(Instant.ofEpochMilli(c.lastPlayed));
+
+            OfflinePlayerData data = OfflinePlayerData.load(plugin, c.uuid);
+            if (data == null) {
+                failedLoads[0]++;
+                appendTestLine(testLog, String.format(
+                        "[%s] %s (%s)%n  Last played: %s (%d days ago)%n  ERROR: could not load playerdata%n",
+                        plugin.getDataManager().format(Instant.now()), name, c.uuid, lastPlayedStr, daysAgo));
+                return;
+            }
+
+            List<ItemStack> loreItems = data.scanLoreItems();
+            if (data.hadConversionFailures() && loreItems.isEmpty()) {
+                failedLoads[0]++;
+            }
+
+            if (loreItems.isEmpty()) {
+                appendTestLine(testLog, String.format(
+                        "[%s] %s (%s)%n  Last played: %s (%d days ago)%n  Lore items: 0%s%n",
+                        plugin.getDataManager().format(Instant.now()), name, c.uuid, lastPlayedStr, daysAgo,
+                        data.hadConversionFailures() ? " (had unreadable items)" : ""));
+                return;
+            }
+
+            playersWithItems[0]++;
+            totalLoreItems[0] += loreItems.size();
+
+            StringBuilder sb = new StringBuilder();
+            sb.append(String.format("[%s] %s (%s)%n", plugin.getDataManager().format(Instant.now()), name, c.uuid));
+            sb.append(String.format("  Last played: %s (%d days ago)%n", lastPlayedStr, daysAgo));
+            sb.append(String.format("  Lore items: %d%n", loreItems.size()));
+            for (ItemStack stack : loreItems) {
+                sb.append("    - ").append(describeItem(stack)).append('\n');
+            }
+            if (data.hadConversionFailures()) {
+                sb.append("  NOTE: some items in this file could not be converted and were skipped\n");
+            }
+            appendTestLine(testLog, sb.toString());
+        }, 1L, 5L);
+    }
+
+    private void appendTestLine(File testLog, String block) {
+        try (PrintWriter out = new PrintWriter(new FileWriter(testLog, true))) {
+            out.print(block);
+            if (!block.endsWith("\n")) out.println();
+            out.println();
+        } catch (IOException e) {
+            plugin.getLogger().warning("Could not write to test log: " + e.getMessage());
+        }
+    }
+
+    private String describeItem(ItemStack stack) {
+        String type = stack.getType().name();
+        int amount = stack.getAmount();
+        String display = null;
+        String lorePreview = null;
+
+        ItemMeta meta = stack.getItemMeta();
+        if (meta != null) {
+            if (meta.hasDisplayName()) {
+                try {
+                    Component nameComp = meta.displayName();
+                    if (nameComp != null) {
+                        display = PLAIN.serialize(nameComp);
+                    }
+                } catch (Exception ignored) {}
+                if (display == null || display.isBlank()) {
+                    try {
+                        display = meta.getDisplayName();
+                    } catch (Exception ignored) {}
+                }
+            }
+            if (meta.hasLore()) {
+                try {
+                    List<Component> loreComps = meta.lore();
+                    if (loreComps != null && !loreComps.isEmpty()) {
+                        lorePreview = PLAIN.serialize(loreComps.get(0));
+                    }
+                } catch (Exception ignored) {}
+                if (lorePreview == null) {
+                    try {
+                        List<String> legacy = meta.getLore();
+                        if (legacy != null && !legacy.isEmpty()) {
+                            lorePreview = legacy.get(0);
+                        }
+                    } catch (Exception ignored) {}
+                }
+            }
+        }
+
+        if (lorePreview != null && lorePreview.length() > 60) {
+            lorePreview = lorePreview.substring(0, 57) + "...";
+        }
+
+        StringBuilder sb = new StringBuilder();
+        sb.append(type).append(" x").append(amount);
+        if (display != null && !display.isBlank()) {
+            sb.append(" \"").append(display).append("\"");
+        }
+        if (lorePreview != null && !lorePreview.isBlank()) {
+            sb.append(" — lore: \"").append(lorePreview).append("\"");
+        }
+        return sb.toString();
     }
 
     private static class OfflinePlayerCandidate {
