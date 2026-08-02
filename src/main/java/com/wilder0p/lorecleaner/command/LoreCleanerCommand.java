@@ -59,8 +59,9 @@ public class LoreCleanerCommand implements CommandExecutor, TabCompleter {
 
     private void handleTest(CommandSender sender, String[] args) {
         if (args.length < 2) {
-            sender.sendMessage(Component.text("Usage: /lorecleaner test <months>", NamedTextColor.RED));
-            sender.sendMessage(Component.text("Example: /lorecleaner test 6", NamedTextColor.GRAY));
+            sender.sendMessage(Component.text("Usage: /lorecleaner test <months> [limit]", NamedTextColor.RED));
+            sender.sendMessage(Component.text("Example: /lorecleaner test 6 10  — 6-month cutoff, only first 10 files", NamedTextColor.GRAY));
+            sender.sendMessage(Component.text("Omit limit to scan every eligible offline player.", NamedTextColor.GRAY));
             return;
         }
 
@@ -77,15 +78,30 @@ public class LoreCleanerCommand implements CommandExecutor, TabCompleter {
             return;
         }
 
-        plugin.getCleanerManager().startTestRun(sender, months);
+        int limit = 0; // 0 = no limit
+        if (args.length >= 3) {
+            try {
+                limit = Integer.parseInt(args[2]);
+            } catch (NumberFormatException e) {
+                sender.sendMessage(Component.text("Limit must be a whole number (e.g. 10).", NamedTextColor.RED));
+                return;
+            }
+            if (limit < 1) {
+                sender.sendMessage(Component.text("Limit must be >= 1 (or omit it for no limit).", NamedTextColor.RED));
+                return;
+            }
+        }
+
+        plugin.getCleanerManager().startTestRun(sender, months, limit);
     }
 
     private void sendHelp(CommandSender sender) {
         sender.sendMessage(Component.text("LoreCleaner commands:", NamedTextColor.GOLD));
-        sender.sendMessage(Component.text("/lorecleaner force       — Force a cleaning cycle", NamedTextColor.YELLOW));
-        sender.sendMessage(Component.text("/lorecleaner test <months> — Dry-run scan; writes timestamped test log", NamedTextColor.YELLOW));
-        sender.sendMessage(Component.text("/lorecleaner status      — Show current state", NamedTextColor.YELLOW));
-        sender.sendMessage(Component.text("/lorecleaner reload      — Reload config.yml", NamedTextColor.YELLOW));
+        sender.sendMessage(Component.text("/lorecleaner force              — Force a cleaning cycle", NamedTextColor.YELLOW));
+        sender.sendMessage(Component.text("/lorecleaner test <months> [limit] — Dry-run; optional file limit", NamedTextColor.YELLOW));
+        sender.sendMessage(Component.text("  e.g. /lorecleaner test 6 10    — 6 months, only 10 files", NamedTextColor.GRAY));
+        sender.sendMessage(Component.text("/lorecleaner status             — Show current state", NamedTextColor.YELLOW));
+        sender.sendMessage(Component.text("/lorecleaner reload             — Reload config.yml", NamedTextColor.YELLOW));
     }
 
     private void sendStatus(CommandSender sender) {
@@ -125,6 +141,11 @@ public class LoreCleanerCommand implements CommandExecutor, TabCompleter {
         if (args.length == 2 && args[0].equalsIgnoreCase("test")) {
             return Stream.of("1", "3", "6", "12")
                     .filter(s -> s.startsWith(args[1]))
+                    .toList();
+        }
+        if (args.length == 3 && args[0].equalsIgnoreCase("test")) {
+            return Stream.of("5", "10", "25", "50", "100")
+                    .filter(s -> s.startsWith(args[2]))
                     .toList();
         }
         return List.of();
