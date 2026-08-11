@@ -13,10 +13,13 @@ import org.bukkit.block.data.type.WallSign;
 import org.bukkit.inventory.ItemStack;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
  * Finds a safe air block near logout and places barrel(s) + wall signs.
+ * Placement can be verified and fully rolled back (barrels + signs → AIR)
+ * if the items in the barrels do not exactly match what was intended.
  */
 public class BarrelPlacer {
 
@@ -60,10 +63,34 @@ public class BarrelPlacer {
     }
 
     /**
-     * @return number of barrels placed
+     * Places barrels + signs, then reads contents back and verifies an exact match
+     * against {@code expected} (same count, same ItemStacks via equals).
+     * On mismatch or incomplete placement, all placed blocks are destroyed.
      */
-    public int placeBarrelsWithItems(Location start, List<ItemStack> items, String playerName) {
-        int barrels = 0;
+    public PlacementResult placeAndVerify(Location start, List<ItemStack> expected, String playerName) {
+        PlacementResult result = placeBarrelsInternal(start, expected, playerName);
+
+        if (!result.placedAllExpected) {
+            result.rollbackReason = "Could not place all items (ran out of air blocks); expected "
+                    + expected.size() + " items, only placed " + result.itemsPlacedBeforeVerify;
+            result.rollback();
+            return result;
+        }
+
+        List<ItemStack> actual = result.readContentsInOrder();
+        if (!exactMatch(expected, actual)) {
+            result.rollbackReason = "Barrel contents did not exactly match extracted lore items "
+                    + "(expected " + expected.size() + " items, read back " + actual.size() + ")";
+            result.rollback();
+            return result;
+        }
+
+        result.verified = true;
+        return result;
+    }
+
+    private PlacementResult placeBarrelsInternal(Location start, List<ItemStack> items, String playerName) {
+        PlacementResult result = new PlacementResult();
         int index = 0;
         Location current = start.clone();
 
@@ -86,34 +113,43 @@ public class BarrelPlacer {
                 if (found == null) {
                     plugin.getLogger().warning(
                             "Ran out of free air blocks while placing barrels for remaining items");
-                    break;
+                    result.placedAllExpected = false;
+                    result.itemsPlacedBeforeVerify = index;
+                    return result;
                 }
                 current = found;
                 block = current.getBlock();
             }
 
             block.setType(Material.BARREL);
+            result.barrelBlocks.add(block.getLocation().clone());
 
             org.bukkit.block.Barrel barrel = (org.bukkit.block.Barrel) block.getState();
             org.bukkit.inventory.Inventory inv = barrel.getInventory();
 
             int slotsFilled = 0;
             while (index < items.size() && slotsFilled < 27) {
-                inv.setItem(slotsFilled, items.get(index));
+                ItemStack clone = items.get(index).clone();
+                inv.setItem(slotsFilled, clone);
                 index++;
                 slotsFilled++;
             }
             barrel.update(true, false);
 
-            placeSignOnBarrel(block, playerName);
+            Location signLoc = placeSignOnBarrel(block, playerName);
+            if (signLoc != null) {
+                result.signBlocks.add(signLoc);
+            }
 
-            barrels++;
             current = block.getLocation().add(1, 0, 0);
         }
-        return barrels;
+
+        result.placedAllExpected = true;
+        result.itemsPlacedBeforeVerify = index;
+        return result;
     }
 
-    private void placeSignOnBarrel(Block barrelBlock, String playerName) {
+    private Location placeSignOnBarrel(Block barrelBlock, String playerName) {
         ConfigManager cfg = plugin.getConfigManager();
         String date = plugin.getDataManager().format(Instant.now());
 
@@ -139,7 +175,73 @@ public class BarrelPlacer {
             sign.getSide(org.bukkit.block.sign.Side.FRONT).setLine(3,
                     cfg.getBarrelSignLine4().replace("%player%", playerName).replace("%date%", date));
             sign.update(true, false);
-            return;
+            return signBlock.getLocation().clone();
+        }
+        return null;
+    }
+
+    static boolean exactMatch(List<ItemStack> expected, List<ItemStack> actual) {
+        if (expected.size() != actual.size()) return false;
+        for (int i = 0; i < expected.size(); i++) {
+            ItemStack e = expected.get(i);
+            ItemStack a = actual.get(i);
+            if (e == null && a == null) continue;
+            if (e == null || a == null) return false;
+            if (!e.equals(a)) return false;
+        }
+        return true;
+    }
+
+    public static final class PlacementResult {
+        public final List<Location> barrelBlocks = new ArrayList<>();
+        public final List<Location> signBlocks = new ArrayList<>();
+        public boolean placedAllExpected = false;
+        public boolean verified = false;
+        public int itemsPlacedBeforeVerify = 0;
+        public String rollbackReason;
+
+        public int barrelCount() {
+            return barrelBlocks.size();
+        }
+
+        public List<ItemStack> readContentsInOrder() {
+            List<ItemStack> out = new ArrayList<>();
+            for (Location loc : barrelBlocks) {
+                Block b = loc.getBlock();
+                if (b.getType() != Material.BARREL) continue;
+                org.bukkit.block.Barrel barrel = (org.bukkit.block.Barrel) b.getState();
+                org.bukkit.inventory.Inventory inv = barrel.getInventory();
+                for (int slot = 0; slot < inv.getSize(); slot++) {
+                    ItemStack stack = inv.getItem(slot);
+                    if (stack != null && stack.getType() != Material.AIR) {
+                        out.add(stack.clone());
+                    }
+                }
+            }
+            return out;
+        }
+
+        public void rollback() {
+            for (Location loc : signBlocks) {
+                Block b = loc.getBlock();
+                if (b.getType().name().contains("SIGN") || b.getType().name().contains("WALL_SIGN")) {
+                    b.setType(Material.AIR);
+                }
+            }
+            for (Location loc : barrelBlocks) {
+                Block b = loc.getBlock();
+                if (b.getType() == Material.BARREL) {
+                    org.bukkit.block.Barrel barrel = (org.bukkit.block.Barrel) b.getState();
+                    barrel.getInventory().clear();
+                    barrel.update(true, false);
+                    b.setType(Material.AIR);
+                }
+            }
+            verified = false;
+        }
+
+        public boolean success() {
+            return verified && placedAllExpected;
         }
     }
 }
