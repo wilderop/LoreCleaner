@@ -239,22 +239,18 @@ public class DataManager {
     public void markScanned(UUID uuid, long lastPlayed) {
         scannedLastPlayed.put(uuid, lastPlayed);
         redis.setScanned(uuid, lastPlayed);
-        dirty = true;
-        unsavedMarks++;
-        if (unsavedMarks >= 50) {
-            save();
-        }
+        markDirtyBatched();
     }
 
+    /**
+     * m2: previously dead — now the single entry point for recording a successful
+     * cleaning (timestamp + login message + cross-server state).
+     */
     public void markCleaned(UUID uuid) {
         lastCleaned.put(uuid, Instant.now());
         pendingLoginMessage.put(uuid, true);
         redis.setCleaned(uuid);
-        dirty = true;
-        unsavedMarks++;
-        if (unsavedMarks >= 50) {
-            save();
-        }
+        markDirtyBatched();
     }
 
     /**
@@ -264,11 +260,13 @@ public class DataManager {
      * m8: intentionally does NOT write a scan snapshot (scannedLastPlayed /
      * redis.setScanned). A snapshot here would make recheck-days never expire —
      * the next cycle should re-evaluate this player normally.
+     * (lastPlayed is retained for API compatibility; no scan snapshot is written.)
      */
     public void markCleanedAndScanned(UUID uuid, long lastPlayed) {
-        lastCleaned.put(uuid, Instant.now());
-        pendingLoginMessage.put(uuid, true);
-        redis.setCleaned(uuid);
+        markCleaned(uuid);
+    }
+
+    private void markDirtyBatched() {
         dirty = true;
         unsavedMarks++;
         if (unsavedMarks >= 50) {
