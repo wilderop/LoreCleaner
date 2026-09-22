@@ -1,6 +1,7 @@
 package com.wilder0p.lorecleaner.manager;
 
 import com.wilder0p.lorecleaner.LoreCleanerPlugin;
+import com.wilder0p.lorecleaner.util.RedisState;
 import org.bukkit.configuration.file.FileConfiguration;
 import org.bukkit.configuration.file.YamlConfiguration;
 
@@ -18,6 +19,7 @@ public class DataManager {
 
     private final LoreCleanerPlugin plugin;
     private final File dataFile;
+    private final RedisState redis;
     private FileConfiguration data;
 
     private Instant firstEnabled;
@@ -41,7 +43,17 @@ public class DataManager {
     public DataManager(LoreCleanerPlugin plugin) {
         this.plugin = plugin;
         this.dataFile = new File(plugin.getDataFolder(), "data.yml");
+        this.redis = new RedisState(plugin.getLogger());
+        this.redis.start();
         load();
+    }
+
+    public RedisState redis() {
+        return redis;
+    }
+
+    public void shutdownRedis() {
+        redis.stop();
     }
 
     public void load() {
@@ -158,6 +170,10 @@ public class DataManager {
     }
 
     public Instant getLastCleaned(UUID uuid) {
+        Instant remote = redis.getCleaned(uuid);
+        if (remote != null) {
+            return remote;
+        }
         return lastCleaned.get(uuid);
     }
 
@@ -166,6 +182,10 @@ public class DataManager {
      * Means they have not logged in since, so the .dat is unchanged — safe to skip.
      */
     public boolean wasScannedAtLastPlayed(UUID uuid, long currentLastPlayed) {
+        Long remote = redis.getScanned(uuid);
+        if (remote != null && remote == currentLastPlayed) {
+            return true;
+        }
         Long stored = scannedLastPlayed.get(uuid);
         return stored != null && stored == currentLastPlayed;
     }
@@ -176,6 +196,7 @@ public class DataManager {
      */
     public void markScanned(UUID uuid, long lastPlayed) {
         scannedLastPlayed.put(uuid, lastPlayed);
+        redis.setScanned(uuid, lastPlayed);
         dirty = true;
         unsavedMarks++;
         if (unsavedMarks >= 50) {
@@ -186,6 +207,7 @@ public class DataManager {
     public void markCleaned(UUID uuid) {
         lastCleaned.put(uuid, Instant.now());
         pendingLoginMessage.put(uuid, true);
+        redis.setCleaned(uuid);
         dirty = true;
         unsavedMarks++;
         if (unsavedMarks >= 50) {
@@ -201,6 +223,8 @@ public class DataManager {
         lastCleaned.put(uuid, Instant.now());
         pendingLoginMessage.put(uuid, true);
         scannedLastPlayed.put(uuid, lastPlayed);
+        redis.setCleaned(uuid);
+        redis.setScanned(uuid, lastPlayed);
         dirty = true;
         unsavedMarks++;
         if (unsavedMarks >= 50) {
@@ -209,11 +233,15 @@ public class DataManager {
     }
 
     public boolean hasPendingLoginMessage(UUID uuid) {
+        if (redis.hasPendingMessage(uuid)) {
+            return true;
+        }
         return Boolean.TRUE.equals(pendingLoginMessage.get(uuid));
     }
 
     public void clearPendingLoginMessage(UUID uuid) {
         pendingLoginMessage.remove(uuid);
+        redis.clearPendingMessage(uuid);
         dirty = true;
         save();
     }

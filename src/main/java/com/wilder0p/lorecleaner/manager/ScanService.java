@@ -3,6 +3,7 @@ package com.wilder0p.lorecleaner.manager;
 import com.wilder0p.lorecleaner.LoreCleanerPlugin;
 import com.wilder0p.lorecleaner.model.OfflinePlayerCandidate;
 import com.wilder0p.lorecleaner.util.ItemFormatter;
+import com.wilder0p.lorecleaner.util.LogoutOwner;
 import com.wilder0p.lorecleaner.util.OfflinePlayerData;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
@@ -90,7 +91,8 @@ public class ScanService {
                     continue;
                 }
                 if (lastPlayed <= 0) continue;
-                if (now - lastPlayed < inactiveMs) continue;
+                if (now - LogoutOwner.lastSeenMs(plugin.getConfigManager(), offline.getUniqueId(), lastPlayed) < inactiveMs) continue;
+                if (LogoutOwner.owner(plugin.getConfigManager(), offline.getUniqueId()) != LogoutOwner.Side.PAPER) continue;
                 if (dataMgr.wasScannedAtLastPlayed(offline.getUniqueId(), lastPlayed)) {
                     skippedUnchanged++;
                     continue;
@@ -315,7 +317,8 @@ public class ScanService {
                     continue;
                 }
                 if (lastPlayed <= 0) continue;
-                if (now - lastPlayed < inactiveMs) continue;
+                if (now - LogoutOwner.lastSeenMs(plugin.getConfigManager(), offline.getUniqueId(), lastPlayed) < inactiveMs) continue;
+                if (LogoutOwner.owner(plugin.getConfigManager(), offline.getUniqueId()) != LogoutOwner.Side.PAPER) continue;
                 candidates.add(new OfflinePlayerCandidate(offline.getUniqueId(), lastPlayed));
             }
             candidates.sort(Comparator.comparingLong(c -> c.lastPlayed));

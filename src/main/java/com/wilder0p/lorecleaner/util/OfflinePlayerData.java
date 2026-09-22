@@ -6,7 +6,6 @@ import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.World;
 import org.bukkit.inventory.ItemStack;
-import org.bukkit.inventory.meta.ItemMeta;
 
 import java.io.File;
 import java.io.FileInputStream;
@@ -259,9 +258,7 @@ public class OfflinePlayerData {
                     hadConversionFailures = true;
                     continue;
                 }
-                if (hasLore(stack)) {
-                    result.add(stack);
-                }
+                result.addAll(LoreExtractor.scan(stack));
             }
         } catch (Exception e) {
             plugin.getLogger().log(Level.WARNING, "Error scanning " + listKey + " for " + uuid, e);
@@ -287,9 +284,21 @@ public class OfflinePlayerData {
                     hadConversionFailures = true;
                     continue;
                 }
-                if (hasLore(stack)) {
-                    result.add(stack);
+                LoreExtractor.Result extracted = LoreExtractor.extract(stack);
+                if (extracted.extracted.isEmpty()) {
+                    continue;
+                }
+                result.addAll(extracted.extracted);
+                if (extracted.remaining == null || extracted.remaining.getType().isAir()) {
                     toRemove.add(i);
+                } else {
+                    Object nbt = itemStackToNbt(extracted.remaining);
+                    if (nbt != null) {
+                        listSet(list, i, nbt);
+                        dirty = true;
+                    } else {
+                        toRemove.add(i);
+                    }
                 }
             }
 
@@ -305,12 +314,6 @@ public class OfflinePlayerData {
             hadConversionFailures = true;
         }
         return result;
-    }
-
-    private boolean hasLore(ItemStack stack) {
-        if (stack == null || stack.getType().isAir()) return false;
-        ItemMeta meta = stack.getItemMeta();
-        return meta != null && meta.hasLore();
     }
 
     public void save() {
@@ -424,6 +427,37 @@ public class OfflinePlayerData {
     private void listRemove(Object list, int index) throws Exception {
         Method m = list.getClass().getMethod("remove", int.class);
         m.invoke(list, index);
+    }
+
+    private void listSet(Object list, int index, Object tag) throws Exception {
+        Method m = list.getClass().getMethod("set", int.class, Class.forName("net.minecraft.nbt.Tag"));
+        m.invoke(list, index, tag);
+    }
+
+    private Object itemStackToNbt(ItemStack stack) {
+        try {
+            Class<?> nmsItemStack = Class.forName("net.minecraft.world.item.ItemStack");
+            Class<?> craftItemStack = Class.forName("org.bukkit.craftbukkit.inventory.CraftItemStack");
+            Class<?> craftRegistry = Class.forName("org.bukkit.craftbukkit.CraftRegistry");
+            Object registryAccess = craftRegistry.getMethod("getMinecraftRegistry").invoke(null);
+            Method asNms = craftItemStack.getMethod("asNMSCopy", ItemStack.class);
+            Object nms = asNms.invoke(null, stack);
+            Object codec = nmsItemStack.getField("CODEC").get(null);
+            Class<?> nbtOps = Class.forName("net.minecraft.nbt.NbtOps");
+            Object ops = nbtOps.getField("INSTANCE").get(null);
+            Method createContext = registryAccess.getClass()
+                    .getMethod("createSerializationContext", Class.forName("com.mojang.serialization.DynamicOps"));
+            Object context = createContext.invoke(registryAccess, ops);
+            Method encodeStart = codec.getClass().getMethod("encodeStart",
+                    Class.forName("com.mojang.serialization.DynamicOps"), Object.class);
+            Object dataResult = encodeStart.invoke(codec, context, nms);
+            Method getOrThrow = dataResult.getClass().getMethod("getOrThrow");
+            return getOrThrow.invoke(dataResult);
+        } catch (Exception e) {
+            plugin.getLogger().log(Level.FINE, "ItemStack → NBT failed for " + uuid, e);
+            hadConversionFailures = true;
+            return null;
+        }
     }
 
     private ItemStack nbtToItemStack(Object itemCompound) {

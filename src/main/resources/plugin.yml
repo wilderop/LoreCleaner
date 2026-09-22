@@ -17,3 +17,9 @@ permissions:
   lorecleaner.admin:
     description: Allows use of LoreCleaner admin commands
     default: op
+
+libraries:
+  - redis.clients:jedis:5.2.0
+  - org.apache.commons:commons-pool2:2.12.1
+  - org.json:json:20240303
+  - org.mariadb.jdbc:mariadb-java-client:3.5.1

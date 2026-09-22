@@ -40,7 +40,8 @@ public final class LoreCleanerPlugin extends JavaPlugin {
         tpsMonitor.start();
         cleanerManager.start();
 
-        getLogger().info("LoreCleaner enabled. Grace period ends at: " + dataManager.getGraceEndTime());
+        getLogger().info("LoreCleaner 1.1.0 enabled (paper+fabric ownership). Grace period ends at: "
+                + dataManager.getGraceEndTime());
     }
 
     @Override
@@ -53,6 +54,7 @@ public final class LoreCleanerPlugin extends JavaPlugin {
         }
         if (dataManager != null) {
             dataManager.save();
+            dataManager.shutdownRedis();
         }
         getLogger().info("LoreCleaner disabled.");
     }

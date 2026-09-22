@@ -4,10 +4,14 @@ import com.wilder0p.lorecleaner.LoreCleanerPlugin;
 import com.wilder0p.lorecleaner.model.OfflinePlayerCandidate;
 import com.wilder0p.lorecleaner.util.BarrelPlacer;
 import com.wilder0p.lorecleaner.util.DiscordWebhook;
+import com.wilder0p.lorecleaner.util.LogoutOwner;
 import com.wilder0p.lorecleaner.util.OfflinePlayerData;
+import com.wilder0p.lorecleaner.util.PdsStore;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.OfflinePlayer;
+import org.bukkit.command.CommandSender;
+import org.bukkit.entity.Player;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.scheduler.BukkitTask;
 
@@ -16,150 +20,195 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.LinkedList;
 import java.util.List;
 import java.util.Queue;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.logging.Level;
 
+/**
+ * Live cleaning cycle: TPS-gated, longest-offline-first queue.
+ * Dry/test scans live in {@link ScanService}.
+ */
 public class CleanerManager {
 
     private final LoreCleanerPlugin plugin;
     private final BarrelPlacer barrelPlacer;
+    private final ScanService scanService;
+    private final PdsStore pdsStore;
 
+    private final Queue<UUID> processQueue = new ConcurrentLinkedQueue<>();
+    private BukkitTask scanTask;
+    private BukkitTask processTask;
+    private boolean forceRun = false;
+    private boolean currentlyProcessing = false;
+    private boolean testRunning = false;
+    private boolean buildingQueue = false;
+    private int processedThisCycle = 0;
+
+    private final File logDir;
     private final File cleanLogFile;
     private final File failedLogFile;
 
-    private final Queue<UUID> processQueue = new LinkedList<>();
-    private boolean currentlyProcessing = false;
-    private boolean buildingQueue = false;
-    private boolean testRunning = false;
-    private int processedThisCycle = 0;
-    private int processedThisMinute = 0;
-    private long minuteWindowStartMs = 0;
-
-    private BukkitTask tickTask;
-
     public CleanerManager(LoreCleanerPlugin plugin) {
         this.plugin = plugin;
-        this.barrelPlacer = new BarrelPlacer(plugin);
-        File logDir = new File(plugin.getDataFolder(), "logs");
+        this.logDir = new File(plugin.getDataFolder(), "logs");
         if (!logDir.exists()) logDir.mkdirs();
         this.cleanLogFile = new File(logDir, "cleaned.log");
-        this.failedLogFile = new File(logDir, "failed.log");
+        this.failedLogFile = new File(logDir, "failed-loads.log");
+        this.barrelPlacer = new BarrelPlacer(plugin);
+        this.scanService = new ScanService(plugin, this, logDir);
+        this.pdsStore = new PdsStore(plugin);
+        this.pdsStore.start();
     }
 
     public void start() {
-        minuteWindowStartMs = System.currentTimeMillis();
-        tickTask = Bukkit.getScheduler().runTaskTimer(plugin, this::tick, 20L, 20L);
+        scanTask = Bukkit.getScheduler().runTaskTimer(plugin, this::decisionTick, 100L, 600L);
     }
 
     public void shutdown() {
-        if (tickTask != null) {
-            tickTask.cancel();
-            tickTask = null;
-        }
-        plugin.getDataManager().saveIfDirty();
+        if (scanTask != null) scanTask.cancel();
+        if (processTask != null) processTask.cancel();
+        scanService.shutdown();
+        testRunning = false;
+        buildingQueue = false;
     }
 
     public boolean isTestRunning() {
         return testRunning;
     }
 
-    public void setTestRunning(boolean running) {
+    void setTestRunning(boolean running) {
         this.testRunning = running;
     }
 
     public void forceRun() {
-        if (currentlyProcessing || buildingQueue || testRunning) {
-            plugin.getLogger().info("Force run ignored — already processing or building queue / test running.");
-            return;
-        }
-        plugin.getLogger().info("Force run requested — building clean queue asynchronously...");
-        startProcessingCycle(true);
+        this.forceRun = true;
+        plugin.getLogger().info(
+                "Force run requested. Will start as soon as TPS conditions allow (or immediately if already stable).");
+        decisionTick();
     }
 
-    private void tick() {
-        long now = System.currentTimeMillis();
-        if (now - minuteWindowStartMs >= 60_000L) {
-            minuteWindowStartMs = now;
-            processedThisMinute = 0;
-        }
+    public void startDryRun(CommandSender sender, int months, int limit) {
+        scanService.startDryRun(sender, months, limit);
+    }
 
-        if (testRunning || buildingQueue) return;
+    public void startTestRun(CommandSender sender, int months, int limit) {
+        scanService.startTestRun(sender, months, limit);
+    }
 
-        if (!currentlyProcessing) {
-            if (plugin.getDataManager().isInGracePeriod()) return;
-            Instant last = plugin.getDataManager().getLastFullRunCompleted();
-            if (last != null) {
-                long cooldownMs = plugin.getConfigManager().getCooldownAfterFullRunHours() * 3600_000L;
-                if (now - last.toEpochMilli() < cooldownMs) return;
-            }
-            if (!plugin.getTpsMonitor().isStableAt20()) return;
-            startProcessingCycle(false);
+    private void decisionTick() {
+        if (currentlyProcessing || buildingQueue) return;
+
+        DataManager data = plugin.getDataManager();
+        ConfigManager cfg = plugin.getConfigManager();
+        if (!cfg.isEnabled()) {
             return;
         }
 
-        if (!plugin.getTpsMonitor().isExactly20()) return;
+        if (data.isInGracePeriod() && !forceRun) {
+            return;
+        }
 
-        int maxPerMin = plugin.getConfigManager().getPlayersPerMinute();
-        if (processedThisMinute >= maxPerMin) return;
+        Instant lastFull = data.getLastFullRunCompleted();
+        if (!forceRun && lastFull != null) {
+            Instant nextAllowed = lastFull.plus(cfg.getCooldownAfterFullRunHours(), ChronoUnit.HOURS);
+            if (Instant.now().isBefore(nextAllowed)) {
+                return;
+            }
+        }
+
+        if (!forceRun && !plugin.getTpsMonitor().isStable()) {
+            return;
+        }
 
         if (processQueue.isEmpty()) {
-            finishCycle();
+            buildingQueue = true;
+            plugin.getLogger().info("Building clean queue asynchronously (avoids main-thread .dat reads)...");
+            Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+                List<UUID> built = buildQueueAsync();
+                Bukkit.getScheduler().runTask(plugin, () -> {
+                    buildingQueue = false;
+                    processQueue.clear();
+                    processQueue.addAll(built);
+                    if (processQueue.isEmpty()) {
+                        if (forceRun) {
+                            forceRun = false;
+                            plugin.getLogger().info("Force run finished — no eligible players found.");
+                        }
+                        return;
+                    }
+                    plugin.getLogger().info(
+                            "Built processing queue with " + processQueue.size()
+                                    + " eligible offline players (oldest first).");
+                    startProcessing();
+                });
+            });
             return;
         }
 
-        UUID uuid = processQueue.poll();
-        if (uuid == null) return;
-        processPlayer(uuid);
-        processedThisCycle++;
-        processedThisMinute++;
+        startProcessing();
     }
 
-    private void startProcessingCycle(boolean force) {
-        if (currentlyProcessing || buildingQueue) return;
-        buildingQueue = true;
-        Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
-            List<UUID> built = buildQueue();
-            Bukkit.getScheduler().runTask(plugin, () -> {
-                processQueue.clear();
-                processQueue.addAll(built);
-                buildingQueue = false;
-                if (processQueue.isEmpty()) {
-                    plugin.getLogger().info("Clean queue empty — nothing to process.");
-                    if (force) {
-                        // still mark nothing
-                    }
-                    return;
-                }
-                currentlyProcessing = true;
-                processedThisCycle = 0;
-                plugin.getLogger().info("Clean cycle started — queue size " + processQueue.size()
-                        + (force ? " (force)" : ""));
-            });
-        });
-    }
-
-    private void finishCycle() {
-        currentlyProcessing = false;
-        plugin.getDataManager().setLastFullRunCompleted(Instant.now());
-        plugin.getDataManager().saveIfDirty();
-        plugin.getLogger().info("Clean cycle finished — processed " + processedThisCycle + " players this cycle.");
+    private void startProcessing() {
+        if (currentlyProcessing) return;
+        currentlyProcessing = true;
         processedThisCycle = 0;
+        ConfigManager cfg = plugin.getConfigManager();
+        DataManager data = plugin.getDataManager();
+        int delayTicks = Math.max(1, 1200 / Math.max(1, cfg.getPlayersPerMinute()));
+
+        processTask = Bukkit.getScheduler().runTaskTimer(plugin, () -> {
+            if (!forceRun && !plugin.getTpsMonitor().isStable()) {
+                return;
+            }
+
+            UUID next = processQueue.poll();
+            if (next == null) {
+                processTask.cancel();
+                currentlyProcessing = false;
+                forceRun = false;
+                data.setLastFullRunCompleted(Instant.now());
+                data.saveIfDirty();
+                plugin.getLogger().info("Full cleaning cycle completed. Next automatic run in "
+                        + cfg.getCooldownAfterFullRunHours() + " hours. Scan snapshots: "
+                        + data.getScannedSnapshotCount());
+                return;
+            }
+
+            Player online = Bukkit.getPlayer(next);
+            if (online != null && online.isOnline()) {
+                return;
+            }
+
+            try {
+                processPlayer(next);
+                processedThisCycle++;
+            } catch (Exception e) {
+                plugin.getLogger().log(Level.WARNING, "Failed to process player " + next, e);
+                logFailed(next, e.getMessage());
+            }
+        }, 1L, delayTicks);
     }
 
-    private List<UUID> buildQueue() {
-        DataManager dataMgr = plugin.getDataManager();
-        long inactiveMs = plugin.getConfigManager().getInactiveDays() * 86400_000L;
-        long recheckMs = plugin.getConfigManager().getRecheckDays() * 86400_000L;
+    private List<UUID> buildQueueAsync() {
+        ConfigManager cfg = plugin.getConfigManager();
+        DataManager data = plugin.getDataManager();
+
+        long inactiveMs = cfg.getInactiveDays() * 86400L * 1000L;
+        long recheckMs = cfg.getRecheckDays() * 86400L * 1000L;
         long now = System.currentTimeMillis();
 
         List<OfflinePlayerCandidate> candidates = new ArrayList<>();
-        for (OfflinePlayer offline : Bukkit.getOfflinePlayers()) {
+
+        OfflinePlayer[] offlinePlayers = Bukkit.getOfflinePlayers();
+        for (OfflinePlayer offline : offlinePlayers) {
             if (offline.getUniqueId() == null) continue;
             if (offline.isOnline()) continue;
+
             long lastPlayed;
             try {
                 lastPlayed = offline.getLastPlayed();
@@ -167,12 +216,21 @@ public class CleanerManager {
                 continue;
             }
             if (lastPlayed <= 0) continue;
-            if (now - lastPlayed < inactiveMs) continue;
+            long lastSeen = LogoutOwner.lastSeenMs(cfg, offline.getUniqueId(), lastPlayed);
+            if (now - lastSeen < inactiveMs) continue;
+            if (LogoutOwner.owner(cfg, offline.getUniqueId()) != LogoutOwner.Side.PAPER) {
+                continue;
+            }
 
-            Instant lastCleaned = dataMgr.getLastCleaned(offline.getUniqueId());
-            if (lastCleaned != null && now - lastCleaned.toEpochMilli() < recheckMs) continue;
+            if (data.wasScannedAtLastPlayed(offline.getUniqueId(), lastPlayed)) {
+                continue;
+            }
 
-            if (dataMgr.wasScannedAtLastPlayed(offline.getUniqueId(), lastPlayed)) continue;
+            Instant lastCleaned = data.getLastCleaned(offline.getUniqueId());
+            if (lastCleaned != null) {
+                long sinceCleaned = now - lastCleaned.toEpochMilli();
+                if (sinceCleaned < recheckMs) continue;
+            }
 
             candidates.add(new OfflinePlayerCandidate(offline.getUniqueId(), lastPlayed));
         }
@@ -193,6 +251,16 @@ public class CleanerManager {
         OfflinePlayer offline = Bukkit.getOfflinePlayer(uuid);
         String name = offline.getName() != null ? offline.getName() : uuid.toString();
         long lastPlayed = offline.getLastPlayed();
+        ConfigManager cfg = plugin.getConfigManager();
+        if (plugin.getDataManager().redis().isNetworkOnline(uuid)) {
+            return;
+        }
+        if (LogoutOwner.owner(cfg, uuid) != LogoutOwner.Side.PAPER) {
+            return;
+        }
+        if (LogoutOwner.recentlyTouched(LogoutOwner.fabricDat(cfg, uuid), 10 * 60 * 1000L)) {
+            return;
+        }
 
         OfflinePlayerData.LoadResult loaded = OfflinePlayerData.loadDetailed(plugin, uuid);
         if (loaded.data == null) {
@@ -233,29 +301,20 @@ public class CleanerManager {
             return;
         }
 
-        BarrelPlacer.PlacementResult placement = barrelPlacer.placeAndVerify(placeLoc, loreItems, name);
-
-        if (!placement.success()) {
-            String reason = placement.rollbackReason != null
-                    ? placement.rollbackReason
-                    : "barrel verification failed";
-            logFailed(uuid, "ABORT — " + reason + " — playerdata left untouched, barrels rolled back");
-            return;
-        }
+        int barrelsPlaced = barrelPlacer.placeBarrelsWithItems(placeLoc, loreItems, name);
 
         if (Bukkit.getPlayer(uuid) != null) {
-            placement.rollback();
-            logFailed(uuid, "Player logged in during processing — barrels rolled back, playerdata NOT modified");
+            logFailed(uuid, "Player logged in during processing — barrels placed but playerdata NOT modified");
             return;
         }
 
         try {
             data.save();
         } catch (Exception e) {
-            logFailed(uuid, "playerdata save failed after verified barrel placement: " + e.getMessage()
-                    + " — barrels left in world (possible duplicate if retried)");
+            logFailed(uuid, "playerdata save failed after barrel placement: " + e.getMessage());
             return;
         }
+        pdsStore.stripLore(uuid);
 
         if (!data.hadConversionFailures()) {
             plugin.getDataManager().markCleanedAndScanned(uuid, lastPlayed);
@@ -264,14 +323,14 @@ public class CleanerManager {
             plugin.getLogger().warning("Player " + name + " had some unreadable items; not marking fully cleaned.");
         }
 
-        String logLine = String.format("[%s] Cleaned %s (%s) — %d lore items moved into %d barrel(s) [verified]",
-                Instant.now(), name, uuid, loreItems.size(), placement.barrelCount());
+        String logLine = String.format("[%s] Cleaned %s (%s) — %d lore items moved into %d barrel(s)",
+                Instant.now(), name, uuid, loreItems.size(), barrelsPlaced);
         plugin.getLogger().info(logLine);
         appendCleanLog(logLine);
 
         if (plugin.getConfigManager().isDiscordEnabled()) {
             DiscordWebhook.send(plugin.getConfigManager().getDiscordWebhookUrl(),
-                    name, loreItems.size(), placement.barrelCount());
+                    name, loreItems.size(), barrelsPlaced);
         }
     }
 

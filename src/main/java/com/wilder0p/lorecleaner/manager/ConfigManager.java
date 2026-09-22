@@ -20,6 +20,11 @@ public class ConfigManager {
     private String barrelSignLine2;
     private String barrelSignLine3;
     private String barrelSignLine4;
+    private boolean enabled;
+    private String paperPlayerDataDir;
+    private String fabricPlayerDataDir;
+    private long fabricGoLiveEpochMs;
+    private String thisSide;
 
     public ConfigManager(LoreCleanerPlugin plugin) {
         this.plugin = plugin;
@@ -44,6 +49,18 @@ public class ConfigManager {
         barrelSignLine2 = cfg.getString("messages.barrel-sign-line2", "%player%");
         barrelSignLine3 = cfg.getString("messages.barrel-sign-line3", "%date%");
         barrelSignLine4 = cfg.getString("messages.barrel-sign-line4", "");
+        enabled = cfg.getBoolean("enabled", true);
+        paperPlayerDataDir = cfg.getString("paper-playerdata-dir",
+                "/mnt/pool/survival/world/players/data");
+        fabricPlayerDataDir = cfg.getString("fabric-playerdata-dir",
+                "/mnt/pool/fabric/world/players/data");
+        String goLive = cfg.getString("fabric-go-live", "2026-09-03T00:00:00Z");
+        try {
+            fabricGoLiveEpochMs = java.time.Instant.parse(goLive).toEpochMilli();
+        } catch (Exception e) {
+            fabricGoLiveEpochMs = java.time.Instant.parse("2026-09-03T00:00:00Z").toEpochMilli();
+        }
+        thisSide = cfg.getString("this-side", "paper");
     }
 
     public int getInactiveDays() { return inactiveDays; }
@@ -60,4 +77,10 @@ public class ConfigManager {
     public String getBarrelSignLine2() { return barrelSignLine2; }
     public String getBarrelSignLine3() { return barrelSignLine3; }
     public String getBarrelSignLine4() { return barrelSignLine4; }
+    public boolean isEnabled() { return enabled; }
+    public String getPaperPlayerDataDir() { return paperPlayerDataDir; }
+    public String getFabricPlayerDataDir() { return fabricPlayerDataDir; }
+    public long getFabricGoLiveEpochMs() { return fabricGoLiveEpochMs; }
+    public String getThisSide() { return thisSide; }
+    public boolean isPaperSide() { return !"fabric".equalsIgnoreCase(thisSide); }
 }

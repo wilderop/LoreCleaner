@@ -1,6 +1,18 @@
 # LoreCleaner Configuration
 # =========================
 
+# Master switch. False = do not start live cleaning cycles.
+enabled: true
+
+# This process: paper | fabric
+this-side: paper
+
+# Last-logout owner is whichever of these .dat files was written later.
+# Fabric files older than fabric-go-live are ignored (world copies).
+paper-playerdata-dir: /mnt/pool/survival/world/players/data
+fabric-playerdata-dir: /mnt/pool/fabric/world/players/data
+fabric-go-live: "2026-09-03T00:00:00Z"
+
 # How many days a player must be offline before their lore items are moved
 inactive-days: 180
 
