@@ -48,6 +48,16 @@ public final class LogoutOwner {
         return Side.PAPER;
     }
 
+    /**
+     * N14: wire this-side into ownership gating. True when this server instance
+     * should clean this player: the logout owner matches the configured side.
+     * When this-side=fabric, Paper-side cleaning is disabled (and vice versa).
+     */
+    public static boolean isOurs(ConfigManager cfg, UUID uuid) {
+        Side want = cfg.isPaperSide() ? Side.PAPER : Side.FABRIC;
+        return owner(cfg, uuid) == want;
+    }
+
     public static boolean recentlyTouched(File file, long maxAgeMs) {
         long m = mtime(file);
         return m > 0 && System.currentTimeMillis() - m < maxAgeMs;

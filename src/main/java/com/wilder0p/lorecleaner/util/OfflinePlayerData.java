@@ -1,11 +1,18 @@
 package com.wilder0p.lorecleaner.util;
 
 import com.wilder0p.lorecleaner.LoreCleanerPlugin;
+import net.kyori.adventure.text.Component;
+import net.kyori.adventure.text.serializer.gson.GsonComponentSerializer;
+import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.Material;
+import org.bukkit.NamespacedKey;
 import org.bukkit.World;
+import org.bukkit.enchantments.Enchantment;
 import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.Damageable;
+import org.bukkit.inventory.meta.ItemMeta;
 
 import java.io.File;
 import java.io.FileInputStream;
@@ -13,8 +20,14 @@ import java.io.FileOutputStream;
 import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Base64;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.logging.Level;
@@ -186,7 +199,10 @@ public class OfflinePlayerData {
 
             World world = resolveWorld();
             if (world == null) {
-                world = Bukkit.getWorlds().get(0);
+                // M4: fail closed — never drop nether/end coordinates into another world.
+                plugin.getLogger().warning(
+                        "Could not resolve logout world for " + uuid + " — skipping (items left untouched)");
+                return null;
             }
             return new Location(world, x, y, z);
         } catch (Exception e) {
@@ -288,17 +304,24 @@ public class OfflinePlayerData {
                 if (extracted.extracted.isEmpty()) {
                     continue;
                 }
+                // N5: verify we can persist the remainder BEFORE committing to the
+                // extraction. On serialization failure the slot is left untouched
+                // (original compound bytes preserved) instead of being deleted.
+                boolean removeSlot = extracted.remaining == null || extracted.remaining.getType().isAir();
+                Object newNbt = null;
+                if (!removeSlot) {
+                    newNbt = itemStackToNbt(extracted.remaining);
+                    if (newNbt == null) {
+                        hadConversionFailures = true;
+                        continue;
+                    }
+                }
                 result.addAll(extracted.extracted);
-                if (extracted.remaining == null || extracted.remaining.getType().isAir()) {
+                if (removeSlot) {
                     toRemove.add(i);
                 } else {
-                    Object nbt = itemStackToNbt(extracted.remaining);
-                    if (nbt != null) {
-                        listSet(list, i, nbt);
-                        dirty = true;
-                    } else {
-                        toRemove.add(i);
-                    }
+                    listSet(list, i, newNbt);
+                    dirty = true;
                 }
             }
 
@@ -319,9 +342,13 @@ public class OfflinePlayerData {
     public void save() {
         if (!dirty) return;
         try {
-            File bak = new File(datFile.getAbsolutePath() + ".lorecleaner.bak");
+            // m4: timestamped backup generations (keep the last 5) instead of a
+            // single file that gets overwritten on every save.
             if (datFile.exists()) {
+                String ts = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").format(LocalDateTime.now());
+                File bak = new File(datFile.getAbsolutePath() + ".lorecleaner.bak." + ts);
                 Files.copy(datFile.toPath(), bak.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                pruneBackups();
             }
 
             File tmp = new File(datFile.getAbsolutePath() + ".tmp");
@@ -336,6 +363,21 @@ public class OfflinePlayerData {
             plugin.getLogger().log(Level.SEVERE, "Failed to save playerdata for " + uuid, e);
             throw new RuntimeException("playerdata save failed for " + uuid, e);
         }
+    }
+
+    private void pruneBackups() {
+        try {
+            File dir = datFile.getParentFile();
+            String prefix = datFile.getName() + ".lorecleaner.bak.";
+            File[] baks = dir.listFiles((d, n) -> n.startsWith(prefix));
+            if (baks == null || baks.length <= 5) return;
+            java.util.Arrays.sort(baks, (a, b) -> a.getName().compareTo(b.getName()));
+            for (int i = 0; i < baks.length - 5; i++) {
+                try {
+                    Files.deleteIfExists(baks[i].toPath());
+                } catch (Exception ignored) {}
+            }
+        } catch (Exception ignored) {}
     }
 
     private static Object readCompressed(File file) throws Exception {
@@ -473,8 +515,15 @@ public class OfflinePlayerData {
                 Method parseOptional = nmsItemStack.getMethod("parseOptional",
                         Class.forName("net.minecraft.core.HolderLookup$Provider"),
                         compoundTagClass);
-                Object nmsStack = parseOptional.invoke(null, registryAccess, itemCompound);
-                if (nmsStack == null) return null;
+                Object result = parseOptional.invoke(null, registryAccess, itemCompound);
+                // C2: on 1.20.5+ parseOptional returns Optional<ItemStack> — unwrap it.
+                Object nmsStack = (result instanceof Optional<?> opt) ? opt.orElse(null) : result;
+                if (nmsStack == null) {
+                    // M5: maybe a legacy pre-1.20.5 {id, Count, tag} item — convert manually.
+                    ItemStack legacy = legacyToItemStack(itemCompound);
+                    if (legacy != null) return legacy;
+                    return null;
+                }
 
                 Method isEmpty = nmsItemStack.getMethod("isEmpty");
                 if (Boolean.TRUE.equals(isEmpty.invoke(nmsStack))) return null;
@@ -524,6 +573,224 @@ public class OfflinePlayerData {
             plugin.getLogger().log(Level.FINE, "NBT → ItemStack conversion failed for one item of " + uuid, e);
             hadConversionFailures = true;
             return null;
+        }
+    }
+
+    /**
+     * N9: canonical pre-extraction inventory snapshot used to verify the PDS DB
+     * payload before stripping. Per section ("inv", "ec"): a multiset of
+     * Base64(Bukkit-serialized) item bytes — order- and slot-index-independent, so
+     * it compares exactly against PDS's own v2 payload format. Slots that fail
+     * conversion are omitted (their absence forces a mismatch → fail-closed skip).
+     */
+    public Map<String, List<String>> canonicalSlotSignatures() {
+        Map<String, List<String>> out = new LinkedHashMap<>();
+        try {
+            out.put("inv", signaturesFor(getList(rootCompound, "Inventory")));
+        } catch (Exception e) {
+            out.put("inv", List.of());
+        }
+        try {
+            out.put("ec", signaturesFor(getList(rootCompound, "EnderItems")));
+        } catch (Exception e) {
+            out.put("ec", List.of());
+        }
+        return out;
+    }
+
+    private List<String> signaturesFor(Object list) {
+        List<String> sigs = new ArrayList<>();
+        if (list == null) return sigs;
+        int size;
+        try {
+            size = listSize(list);
+        } catch (Exception e) {
+            return sigs;
+        }
+        for (int i = 0; i < size; i++) {
+            try {
+                Object compound = listGetCompound(list, i);
+                if (compound == null) continue;
+                ItemStack stack = nbtToItemStack(compound);
+                if (stack == null || stack.getType().isAir()) continue;
+                sigs.add(Base64.getEncoder().encodeToString(stack.serializeAsBytes()));
+            } catch (Exception ignored) {}
+        }
+        return sigs;
+    }
+
+    /**
+     * M5: convert a pre-1.20.5 {@code {id, Count, tag}} item compound into a Bukkit
+     * ItemStack by mapping the legacy fields manually. Returns null when the compound
+     * is not legacy-shaped or cannot be mapped (caller then treats the item as a
+     * conversion failure and leaves it untouched).
+     */
+    private ItemStack legacyToItemStack(Object itemCompound) {
+        try {
+            // Legacy shape has capital-C "Count" and no "components"; modern has neither.
+            if (!compoundHasKey(itemCompound, "Count") || compoundHasKey(itemCompound, "components")) {
+                return null;
+            }
+            String id = compoundGetString(itemCompound, "id");
+            if (id == null || id.isEmpty()) return null;
+
+            Material mat;
+            try {
+                mat = Material.matchMaterial(id);
+            } catch (Exception e) {
+                mat = null;
+            }
+            if (mat == null || mat.isAir()) {
+                return null; // numeric pre-1.13 ids are not reliably mappable — fail safe
+            }
+
+            int count = getByteAsInt(itemCompound, "Count", 1);
+            if (count < 1) count = 1;
+            count = Math.min(count, mat.getMaxStackSize());
+            ItemStack stack = new ItemStack(mat, count);
+
+            int damage = getShortAsInt(itemCompound, "Damage", 0);
+            if (damage > 0 && stack.getItemMeta() instanceof Damageable dmg) {
+                dmg.setDamage(Math.min(damage, mat.getMaxDurability()));
+                stack.setItemMeta(dmg);
+            }
+
+            Object tag = compoundGetCompound(itemCompound, "tag");
+            if (tag != null && !applyLegacyTag(stack, tag)) {
+                return null; // could not transfer display data — keep the item untouched
+            }
+            return stack;
+        } catch (Exception e) {
+            plugin.getLogger().log(Level.FINE, "Legacy item conversion failed for " + uuid, e);
+            return null;
+        }
+    }
+
+    /** Transfer display name/lore, enchantments and unbreakable flag from a legacy tag compound. */
+    private boolean applyLegacyTag(ItemStack stack, Object tag) {
+        try {
+            ItemMeta meta = stack.getItemMeta();
+            if (meta == null) return true;
+            boolean touched = false;
+
+            Object display = compoundGetCompound(tag, "display");
+            if (display != null) {
+                String nameJson = compoundGetString(display, "Name");
+                if (nameJson != null && !nameJson.isEmpty()) {
+                    meta.displayName(parseLegacyText(nameJson));
+                    touched = true;
+                }
+                Object loreList = getList(display, "Lore");
+                if (loreList != null) {
+                    int size = listSize(loreList);
+                    List<Component> lore = new ArrayList<>(size);
+                    for (int i = 0; i < size; i++) {
+                        lore.add(parseLegacyText(listGetString(loreList, i)));
+                    }
+                    meta.lore(lore);
+                    touched = true;
+                }
+            }
+
+            Object enchList = getList(tag, "Enchantments");
+            if (enchList != null) {
+                int size = listSize(enchList);
+                for (int i = 0; i < size; i++) {
+                    Object enchCompound = listGetCompound(enchList, i);
+                    if (enchCompound == null) continue;
+                    String enchId = compoundGetString(enchCompound, "id");
+                    int lvl = getShortAsInt(enchCompound, "lvl", 0);
+                    if (enchId == null || lvl <= 0) continue;
+                    Enchantment ench = Enchantment.getByKey(
+                            NamespacedKey.fromString(enchId.toLowerCase(Locale.ROOT)));
+                    if (ench != null) {
+                        try {
+                            meta.addEnchant(ench, lvl, true);
+                            touched = true;
+                        } catch (Exception ignored) {}
+                    }
+                }
+            }
+
+            try {
+                Method getByte = tag.getClass().getMethod("getByte", String.class);
+                Object ub = getByte.invoke(tag, "Unbreakable");
+                if (ub instanceof Number n && n.byteValue() != 0) {
+                    meta.setUnbreakable(true);
+                    touched = true;
+                }
+            } catch (Exception ignored) {}
+
+            if (touched) stack.setItemMeta(meta);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** Legacy lore/name strings are JSON chat components (1.13+); pre-1.13 they are §-coded. */
+    private Component parseLegacyText(String s) {
+        if (s == null) return Component.empty();
+        try {
+            return GsonComponentSerializer.gson().deserialize(s);
+        } catch (Exception e) {
+            try {
+                return LegacyComponentSerializer.legacySection().deserialize(s);
+            } catch (Exception e2) {
+                return Component.text(s);
+            }
+        }
+    }
+
+    private boolean compoundHasKey(Object compound, String key) {
+        try {
+            Method m = compound.getClass().getMethod("contains", String.class);
+            return Boolean.TRUE.equals(m.invoke(compound, key));
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private Object compoundGetCompound(Object compound, String key) throws Exception {
+        try {
+            Method m = compound.getClass().getMethod("getCompound", String.class);
+            Object result = m.invoke(compound, key);
+            if (result instanceof Optional<?> opt) {
+                return opt.orElse(null);
+            }
+            return result;
+        } catch (NoSuchMethodException e) {
+            return null;
+        }
+    }
+
+    private String listGetString(Object list, int index) throws Exception {
+        try {
+            Method m = list.getClass().getMethod("getString", int.class);
+            return (String) m.invoke(list, index);
+        } catch (NoSuchMethodException e) {
+            Object o = list.getClass().getMethod("get", int.class).invoke(list, index);
+            return o != null ? o.toString() : null;
+        }
+    }
+
+    private int getByteAsInt(Object compound, String key, int def) {
+        try {
+            Method m = compound.getClass().getMethod("getByte", String.class);
+            Object v = m.invoke(compound, key);
+            return v instanceof Number n ? n.intValue() : def;
+        } catch (Exception e) {
+            return def;
+        }
+    }
+
+    private int getShortAsInt(Object compound, String key, int def) {
+        try {
+            Method m = compound.getClass().getMethod("getShort", String.class);
+            Object v = m.invoke(compound, key);
+            return v instanceof Number n ? n.intValue() : def;
+        } catch (Exception e) {
+            return def;
         }
     }
 }

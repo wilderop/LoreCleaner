@@ -24,6 +24,7 @@ import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.Queue;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -218,7 +219,7 @@ public class CleanerManager {
             if (lastPlayed <= 0) continue;
             long lastSeen = LogoutOwner.lastSeenMs(cfg, offline.getUniqueId(), lastPlayed);
             if (now - lastSeen < inactiveMs) continue;
-            if (LogoutOwner.owner(cfg, offline.getUniqueId()) != LogoutOwner.Side.PAPER) {
+            if (!LogoutOwner.isOurs(cfg, offline.getUniqueId())) {
                 continue;
             }
 
@@ -243,40 +244,90 @@ public class CleanerManager {
         return result;
     }
 
+    /**
+     * C1: .dat disk/NBT work runs on an async thread; only world mutation runs on
+     * the main thread. C3: inactivity is revalidated immediately before mutation.
+     */
     private void processPlayer(UUID uuid) {
         if (Bukkit.getPlayer(uuid) != null) {
             return;
+        }
+        if (plugin.getDataManager().redis().isNetworkOnline(uuid)) {
+            return; // fail-closed: unknown Redis state counts as online
         }
 
         OfflinePlayer offline = Bukkit.getOfflinePlayer(uuid);
         String name = offline.getName() != null ? offline.getName() : uuid.toString();
         long lastPlayed = offline.getLastPlayed();
         ConfigManager cfg = plugin.getConfigManager();
-        if (plugin.getDataManager().redis().isNetworkOnline(uuid)) {
-            return;
-        }
-        if (LogoutOwner.owner(cfg, uuid) != LogoutOwner.Side.PAPER) {
+        if (!LogoutOwner.isOurs(cfg, uuid)) {
             return;
         }
         if (LogoutOwner.recentlyTouched(LogoutOwner.fabricDat(cfg, uuid), 10 * 60 * 1000L)) {
             return;
         }
 
-        OfflinePlayerData.LoadResult loaded = OfflinePlayerData.loadDetailed(plugin, uuid);
-        if (loaded.data == null) {
-            logFailed(uuid, loaded.status + ": " + loaded.detail);
-            return;
-        }
-        OfflinePlayerData data = loaded.data;
-
-        List<ItemStack> scanned = data.scanLoreItems();
-
-        if (scanned.isEmpty()) {
-            if (!data.hadConversionFailures()) {
-                plugin.getDataManager().markScanned(uuid, lastPlayed);
-            } else {
-                logFailed(uuid, "Had unreadable items; not marking scanned so they can be retried later");
+        // --- async stage: disk + NBT only, no world access ---
+        Bukkit.getScheduler().runTaskAsynchronously(plugin, () -> {
+            OfflinePlayerData.LoadResult loaded = OfflinePlayerData.loadDetailed(plugin, uuid);
+            if (loaded.data == null) {
+                if (loaded.status == OfflinePlayerData.LoadStatus.FILE_MISSING) {
+                    // m5: no .dat exists — nothing to clean. Record the scan so this
+                    // player stops spamming failed-loads.log every cycle. A future
+                    // login changes lastPlayed and re-enables them automatically.
+                    Bukkit.getScheduler().runTask(plugin, () ->
+                            plugin.getDataManager().markScanned(uuid, lastPlayed));
+                } else {
+                    String reason = loaded.status + ": " + loaded.detail;
+                    Bukkit.getScheduler().runTask(plugin, () -> logFailed(uuid, reason));
+                }
+                return;
             }
+            OfflinePlayerData data = loaded.data;
+
+            List<ItemStack> scanned = data.scanLoreItems();
+            if (scanned.isEmpty()) {
+                Bukkit.getScheduler().runTask(plugin, () -> {
+                    if (!data.hadConversionFailures()) {
+                        plugin.getDataManager().markScanned(uuid, lastPlayed);
+                    } else {
+                        logFailed(uuid, "Had unreadable items; not marking scanned so they can be retried later");
+                    }
+                });
+                return;
+            }
+
+            // N9: capture the pre-extraction inventory state so the PDS strip can
+            // verify the DB still holds exactly these items before modifying it.
+            Map<String, List<String>> preCleanSigs = data.canonicalSlotSignatures();
+
+            List<ItemStack> loreItems = data.extractAndRemoveLoreItems();
+            if (loreItems.isEmpty()) {
+                Bukkit.getScheduler().runTask(plugin, () -> {
+                    if (!data.hadConversionFailures()) {
+                        plugin.getDataManager().markScanned(uuid, lastPlayed);
+                    }
+                });
+                return;
+            }
+
+            final List<ItemStack> items = loreItems;
+            Bukkit.getScheduler().runTask(plugin, () ->
+                    processPlayerSync(uuid, name, lastPlayed, data, items, preCleanSigs));
+        });
+    }
+
+    /** Main-thread stage: revalidate everything, then place barrels and save. */
+    private void processPlayerSync(UUID uuid, String name, long lastPlayed,
+                                   OfflinePlayerData data, List<ItemStack> loreItems,
+                                   Map<String, List<String>> preCleanSigs) {
+        // C3: revalidate inactivity immediately before mutation.
+        if (Bukkit.getPlayer(uuid) != null
+                || plugin.getDataManager().redis().isNetworkOnline(uuid)
+                || Bukkit.getOfflinePlayer(uuid).getLastPlayed() != lastPlayed
+                || LogoutOwner.recentlyTouched(
+                        LogoutOwner.fabricDat(plugin.getConfigManager(), uuid), 10 * 60 * 1000L)) {
+            logFailed(uuid, "Player state changed during processing — items left untouched");
             return;
         }
 
@@ -286,35 +337,69 @@ public class CleanerManager {
             return;
         }
 
+        // M6: preload the logout chunk asynchronously; skip when it cannot be
+        // loaded from disk without generating terrain.
+        logoutLoc.getWorld().getChunkAtAsync(logoutLoc, false).thenAccept(chunk ->
+                Bukkit.getScheduler().runTask(plugin, () -> {
+                    if (chunk == null || !chunk.isLoaded()) {
+                        logFailed(uuid, "Logout chunk not loadable without terrain generation — skipping");
+                        return;
+                    }
+                    placeAndSave(uuid, name, lastPlayed, data, loreItems, preCleanSigs, logoutLoc);
+                }));
+    }
+
+    private void placeAndSave(UUID uuid, String name, long lastPlayed,
+                              OfflinePlayerData data, List<ItemStack> loreItems,
+                              Map<String, List<String>> preCleanSigs, Location logoutLoc) {
+        if (Bukkit.getPlayer(uuid) != null) {
+            logFailed(uuid, "Player logged in before placement — items left untouched");
+            return;
+        }
+
         Location placeLoc = barrelPlacer.findSafeBarrelLocation(logoutLoc);
         if (placeLoc == null) {
             logFailed(uuid, "Could not find a valid air block inside world border — items left untouched");
             return;
         }
 
-        if (Bukkit.getPlayer(uuid) != null) {
+        BarrelPlacer.PlacementResult placed;
+        try {
+            placed = barrelPlacer.placeBarrelsWithItems(placeLoc, loreItems, name);
+        } catch (Exception e) {
+            // placeBarrelsWithItems already rolled back any partial placement.
+            logFailed(uuid, "Barrel placement failed and was rolled back — items left untouched: " + e.getMessage());
             return;
         }
 
-        List<ItemStack> loreItems = data.extractAndRemoveLoreItems();
-        if (loreItems.isEmpty()) {
+        if (!placed.complete) {
+            // N1: ran out of air — roll back BEFORE the .dat save so nothing is lost.
+            barrelPlacer.rollbackPlacement(placed);
+            logFailed(uuid, "Placement incomplete (" + placed.itemsPlaced + "/" + loreItems.size()
+                    + " items) — rolled back, items left untouched");
             return;
         }
 
-        int barrelsPlaced = barrelPlacer.placeBarrelsWithItems(placeLoc, loreItems, name);
-
         if (Bukkit.getPlayer(uuid) != null) {
-            logFailed(uuid, "Player logged in during processing — barrels placed but playerdata NOT modified");
+            // N8: player logged in during processing — roll back, never save.
+            barrelPlacer.rollbackPlacement(placed);
+            logFailed(uuid, "Player logged in during processing — barrels rolled back, playerdata NOT modified");
             return;
         }
 
         try {
             data.save();
         } catch (Exception e) {
-            logFailed(uuid, "playerdata save failed after barrel placement: " + e.getMessage());
+            // N7: .dat save failed — roll back the barrels so items are neither
+            // duplicated nor lost.
+            barrelPlacer.rollbackPlacement(placed);
+            logFailed(uuid, "playerdata save failed after barrel placement — barrels rolled back: " + e.getMessage());
             return;
         }
-        pdsStore.stripLore(uuid);
+
+        // N9: strip PDS lore only when the DB payload still matches the pre-clean
+        // local state; mismatch skips loudly inside stripLore.
+        pdsStore.stripLore(uuid, preCleanSigs);
 
         if (!data.hadConversionFailures()) {
             plugin.getDataManager().markCleanedAndScanned(uuid, lastPlayed);
@@ -324,13 +409,13 @@ public class CleanerManager {
         }
 
         String logLine = String.format("[%s] Cleaned %s (%s) — %d lore items moved into %d barrel(s)",
-                Instant.now(), name, uuid, loreItems.size(), barrelsPlaced);
+                Instant.now(), name, uuid, loreItems.size(), placed.barrelsPlaced);
         plugin.getLogger().info(logLine);
         appendCleanLog(logLine);
 
         if (plugin.getConfigManager().isDiscordEnabled()) {
             DiscordWebhook.send(plugin.getConfigManager().getDiscordWebhookUrl(),
-                    name, loreItems.size(), barrelsPlaced);
+                    name, loreItems.size(), placed.barrelsPlaced);
         }
     }
 

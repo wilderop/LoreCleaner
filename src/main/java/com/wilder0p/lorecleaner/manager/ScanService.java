@@ -199,6 +199,9 @@ public class ScanService {
             if (loaded.data == null) {
                 if (loaded.status == OfflinePlayerData.LoadStatus.FILE_MISSING) {
                     missingFiles[0]++;
+                    // m5: nothing to ever clean here — record the scan so this
+                    // candidate stops being retried/reported every cycle.
+                    dataMgr.markScanned(c.uuid, c.lastPlayed);
                 } else {
                     failedLoads[0]++;
                     if (failedLoads[0] <= 50) {
@@ -290,6 +293,11 @@ public class ScanService {
     public void startTestRun(CommandSender sender, int months, int limit) {
         if (cleaner.isTestRunning()) {
             sender.sendMessage(Component.text("A test/dry scan is already running. Wait for it to finish.", NamedTextColor.RED));
+            return;
+        }
+        // m9: never run a test scan concurrently with the live cleaning cycle.
+        if (cleaner.isCurrentlyProcessing()) {
+            sender.sendMessage(Component.text("A live cleaning cycle is running. Wait for it to finish.", NamedTextColor.RED));
             return;
         }
         if (months < 1) {

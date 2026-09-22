@@ -31,6 +31,19 @@
             <version>26.2.build.87-stable</version>
             <scope>provided</scope>
         </dependency>
+        <!-- Provided at runtime via plugin.yml `libraries` (Paper library loader). -->
+        <dependency>
+            <groupId>redis.clients</groupId>
+            <artifactId>jedis</artifactId>
+            <version>5.2.0</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.google.code.gson</groupId>
+            <artifactId>gson</artifactId>
+            <version>2.13.1</version>
+            <scope>provided</scope>
+        </dependency>
     </dependencies>
 
     <build>

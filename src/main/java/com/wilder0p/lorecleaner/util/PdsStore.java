@@ -11,6 +11,9 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -61,10 +64,18 @@ public final class PdsStore {
     }
 
     /**
-     * Strip lore from DB inventories. Returns extracted stacks (may be empty if DB had none extra).
-     * Does not place barrels — caller already has items from .dat.
+     * Strip lore from DB inventories.
+     *
+     * N13: this method is VOID — it does not return extracted stacks. The extracted
+     * items come from the offline .dat pass (see {@link OfflinePlayerData}); this
+     * store only strips DB-side lore.
+     *
+     * N9: each v2 section is verified against {@code expectedSignatures} (the
+     * pre-clean local snapshot from {@link OfflinePlayerData#canonicalSlotSignatures})
+     * before stripping. A mismatch means the DB row belongs to a different session —
+     * the section is skipped and logged LOUDLY, never stripped.
      */
-    public void stripLore(UUID uuid) {
+    public void stripLore(UUID uuid, Map<String, List<String>> expectedSignatures) {
         if (!ready || uuid == null) {
             return;
         }
@@ -81,17 +92,8 @@ public final class PdsStore {
                 }
                 JsonObject root = JsonParser.parseString(raw).getAsJsonObject();
                 boolean changed = false;
-                for (String field : List.of("inventoryContents", "enderChestContents")) {
-                    if (!root.has(field) || root.get(field).isJsonNull()) {
-                        continue;
-                    }
-                    String payload = root.get(field).getAsString();
-                    String next = stripPayload(payload);
-                    if (next != null && !next.equals(payload)) {
-                        root.addProperty(field, next);
-                        changed = true;
-                    }
-                }
+                changed |= stripSectionIfVerified(uuid, root, "inventoryContents", "inv", expectedSignatures);
+                changed |= stripSectionIfVerified(uuid, root, "enderChestContents", "ec", expectedSignatures);
                 if (!changed) {
                     return;
                 }
@@ -105,6 +107,62 @@ public final class PdsStore {
         } catch (Exception e) {
             plugin.getLogger().log(Level.WARNING, "PDS lore strip failed for " + uuid + ": " + e.getMessage());
         }
+    }
+
+    /**
+     * N9: verify one DB section against the pre-clean local snapshot, then strip it.
+     * Returns true when the section was modified. Any verification problem skips the
+     * section loudly and never strips it.
+     */
+    private boolean stripSectionIfVerified(UUID uuid, JsonObject root, String field, String section,
+                                           Map<String, List<String>> expectedSignatures) {
+        if (!root.has(field) || root.get(field).isJsonNull()) {
+            return false;
+        }
+        String payload = root.get(field).getAsString();
+        if (SlotDataFormat.kind(payload) != SlotDataFormat.Kind.V2) {
+            plugin.getLogger().warning("PDS inventory not v2 (" + SlotDataFormat.kind(payload)
+                    + "); leaving DB " + field + " unchanged for " + uuid);
+            return false;
+        }
+        List<String> expected = expectedSignatures != null
+                ? expectedSignatures.getOrDefault(section, List.of()) : List.of();
+        List<String> actual = new ArrayList<>();
+        for (Map.Entry<Integer, byte[]> e : SlotDataFormat.decodeV2(payload).entrySet()) {
+            try {
+                actual.add(Base64.getEncoder().encodeToString(
+                        ItemStack.deserializeBytes(e.getValue()).serializeAsBytes()));
+            } catch (Exception ex) {
+                plugin.getLogger().severe("PDS STRIP SKIPPED for " + uuid + " — DB " + field
+                        + " slot " + e.getKey() + " is not deserializable; NOT stripping (fail closed)");
+                return false;
+            }
+        }
+        if (!multisetEquals(expected, actual)) {
+            plugin.getLogger().severe("PDS STRIP SKIPPED for " + uuid + " — DB " + field
+                    + " does not match cleaned local state (db items=" + actual.size()
+                    + ", local items=" + expected.size()
+                    + "). The DB may belong to a different session; NOT stripping.");
+            return false;
+        }
+        String next = stripPayload(payload);
+        if (next != null && !next.equals(payload)) {
+            root.addProperty(field, next);
+            return true;
+        }
+        return false;
+    }
+
+    private static boolean multisetEquals(List<String> a, List<String> b) {
+        if (a.size() != b.size()) return false;
+        Map<String, Integer> counts = new HashMap<>();
+        for (String s : a) counts.merge(s, 1, Integer::sum);
+        for (String s : b) {
+            Integer n = counts.get(s);
+            if (n == null || n == 0) return false;
+            counts.put(s, n - 1);
+        }
+        return true;
     }
 
     private String stripPayload(String payload) {

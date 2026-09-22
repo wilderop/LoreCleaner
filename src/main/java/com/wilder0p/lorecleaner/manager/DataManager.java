@@ -7,12 +7,15 @@ import org.bukkit.configuration.file.YamlConfiguration;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.time.Instant;
+import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
-import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Level;
 
 public class DataManager {
@@ -24,15 +27,16 @@ public class DataManager {
 
     private Instant firstEnabled;
     private Instant lastFullRunCompleted;
-    private final Map<UUID, Instant> lastCleaned = new HashMap<>();
-    private final Map<UUID, Boolean> pendingLoginMessage = new HashMap<>();
+    // m1: read from the async queue-builder thread while the main thread writes.
+    private final Map<UUID, Instant> lastCleaned = new ConcurrentHashMap<>();
+    private final Map<UUID, Boolean> pendingLoginMessage = new ConcurrentHashMap<>();
 
     /**
      * UUID → OfflinePlayer.getLastPlayed() value at the time we last successfully
      * scanned their .dat. If current lastPlayed still equals this, the file has not
      * changed (player has not logged in), so we can skip re-reading it.
      */
-    private final Map<UUID, Long> scannedLastPlayed = new HashMap<>();
+    private final Map<UUID, Long> scannedLastPlayed = new ConcurrentHashMap<>();
 
     private boolean dirty = false;
     private int unsavedMarks = 0;
@@ -43,9 +47,21 @@ public class DataManager {
     public DataManager(LoreCleanerPlugin plugin) {
         this.plugin = plugin;
         this.dataFile = new File(plugin.getDataFolder(), "data.yml");
-        this.redis = new RedisState(plugin.getLogger());
+        this.redis = new RedisState(plugin.getLogger(), buildRedisOptions(plugin.getConfigManager()));
         this.redis.start();
         load();
+    }
+
+    private static RedisState.Options buildRedisOptions(ConfigManager cfg) {
+        RedisState.Options opts = new RedisState.Options();
+        if (cfg == null) return opts;
+        opts.sentinelMaster = cfg.getRedisSentinelMaster();
+        opts.sentinels = cfg.getRedisSentinels();
+        opts.fallbackHost = cfg.getRedisFallbackHost();
+        opts.fallbackPort = cfg.getRedisFallbackPort();
+        opts.passwordFile = cfg.getRedisPasswordFile();
+        opts.failClosed = cfg.isRedisFailClosed();
+        return opts;
     }
 
     public RedisState redis() {
@@ -56,10 +72,36 @@ public class DataManager {
         redis.stop();
     }
 
+    /**
+     * M3: a corrupt or empty data.yml no longer silently resets every player. The
+     * suspect file is timestamped aside and loading starts from a blank state.
+     */
     public void load() {
         if (!dataFile.exists()) {
             firstEnabled = Instant.now();
             lastFullRunCompleted = null;
+            save();
+            return;
+        }
+
+        try {
+            String text = Files.readString(dataFile.toPath());
+            if (text.isBlank() || !text.contains(":")) {
+                throw new IOException("data.yml is empty or has no keys");
+            }
+        } catch (IOException e) {
+            try {
+                String ts = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss").format(LocalDateTime.now());
+                Files.move(dataFile.toPath(),
+                        dataFile.toPath().resolveSibling(dataFile.getName() + ".corrupt." + ts),
+                        StandardCopyOption.REPLACE_EXISTING);
+            } catch (IOException moveEx) {
+                plugin.getLogger().log(Level.SEVERE, "Failed to back up corrupt data.yml", moveEx);
+            }
+            plugin.getLogger().severe("data.yml was corrupt or empty — backed it up and starting fresh");
+            firstEnabled = Instant.now();
+            lastFullRunCompleted = null;
+            data = YamlConfiguration.loadConfiguration(dataFile);
             save();
             return;
         }
@@ -216,15 +258,17 @@ public class DataManager {
     }
 
     /**
-     * After a successful clean (items moved), record both cleaned time and the
-     * lastPlayed we scanned under so we do not immediately re-open the same file.
+     * After a successful clean (items moved), record the cleaned time and queue the
+     * login message.
+     *
+     * m8: intentionally does NOT write a scan snapshot (scannedLastPlayed /
+     * redis.setScanned). A snapshot here would make recheck-days never expire —
+     * the next cycle should re-evaluate this player normally.
      */
     public void markCleanedAndScanned(UUID uuid, long lastPlayed) {
         lastCleaned.put(uuid, Instant.now());
         pendingLoginMessage.put(uuid, true);
-        scannedLastPlayed.put(uuid, lastPlayed);
         redis.setCleaned(uuid);
-        redis.setScanned(uuid, lastPlayed);
         dirty = true;
         unsavedMarks++;
         if (unsavedMarks >= 50) {

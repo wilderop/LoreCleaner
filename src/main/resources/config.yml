@@ -34,6 +34,27 @@ players-per-minute: 4
 # inactivity before cleaning them again (in case they accumulate new lore items)
 recheck-days: 180
 
+# When true, never place a barrel/sign on a block inside a WorldGuard region or
+# GriefPrevention claim. If protection cannot be verified, the location is skipped.
+skip-protected-regions: true
+
+# Redis (cross-server online status / shared cleaned-scanned state)
+redis:
+  # Sentinel master name and sentinel host:port list
+  sentinel-master: "azpbmd"
+  sentinels:
+    - "10.0.0.1:26379"
+    - "10.0.0.2:26379"
+    - "10.0.0.3:26379"
+  # Direct fallback when Sentinel is unreachable
+  fallback-host: "10.0.0.3"
+  fallback-port: 6379
+  # File whose first line is the Redis password (empty file / missing = no auth)
+  password-file: "/mnt/pool/skygate/redis.pass"
+  # When true, an unreachable Redis means "treat player as online" (skip them).
+  # When false, an unreachable Redis means "treat as offline" (less safe).
+  fail-closed: true
+
 # Discord webhook URL (leave empty to disable)
 # Never includes coordinates
 discord-webhook-url: ""
