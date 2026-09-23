@@ -6,8 +6,6 @@ import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.plugin.java.JavaPlugin;
 
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.sql.Connection;
 import java.sql.DriverManager;
@@ -22,7 +20,6 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.UUID;
 import java.util.logging.Level;
-import java.util.zip.GZIPInputStream;
 
 /** Strip lore from PlayerDataSync MariaDB inventory + ender chest (v2 slot payload). */
 public final class PdsStore {
@@ -133,10 +130,8 @@ public final class PdsStore {
         List<String> actual = new ArrayList<>();
         for (Map.Entry<Integer, byte[]> e : SlotDataFormat.decodeV2(payload).entrySet()) {
             try {
-                // F4: dual framing — raw first, gzip fallback. Anything else
-                // fails closed (skip the whole section, never strip).
                 actual.add(Base64.getEncoder().encodeToString(
-                        deserializeSlot(e.getValue()).serializeAsBytes()));
+                        ItemStack.deserializeBytes(e.getValue()).serializeAsBytes()));
             } catch (Exception ex) {
                 plugin.getLogger().severe("PDS STRIP SKIPPED for " + uuid + " — DB " + field
                         + " slot " + e.getKey() + " is not deserializable; NOT stripping (fail closed)");
@@ -170,33 +165,6 @@ public final class PdsStore {
         return true;
     }
 
-    /**
-     * F4: decode one v2 slot's bytes with DUAL framing. Raw
-     * {@code ItemStack.deserializeBytes} framing is tried first (what the
-     * Fabric side writes and what current PlayerDataSync rows use); gzip-
-     * wrapped bytes are the fallback for older rows. Anything else throws
-     * and the caller must preserve the slot / skip the section — never strip.
-     */
-    private static ItemStack deserializeSlot(byte[] bytes) {
-        Exception rawEx;
-        try {
-            return ItemStack.deserializeBytes(bytes);
-        } catch (Exception e) {
-            rawEx = e;
-        }
-        try (GZIPInputStream gzip = new GZIPInputStream(new ByteArrayInputStream(bytes));
-             ByteArrayOutputStream out = new ByteArrayOutputStream()) {
-            gzip.transferTo(out);
-            return ItemStack.deserializeBytes(out.toByteArray());
-        } catch (Exception gzipEx) {
-            IllegalArgumentException ex =
-                    new IllegalArgumentException("slot bytes match neither raw nor gzip framing");
-            ex.addSuppressed(rawEx);
-            ex.addSuppressed(gzipEx);
-            throw ex;
-        }
-    }
-
     private String stripPayload(String payload) {
         SlotDataFormat.Kind kind = SlotDataFormat.kind(payload);
         if (kind != SlotDataFormat.Kind.V2) {
@@ -209,9 +177,7 @@ public final class PdsStore {
         for (Map.Entry<Integer, byte[]> e : slots.entrySet()) {
             ItemStack stack;
             try {
-                // F4: dual framing — raw first, gzip fallback. Undecodable
-                // slots are preserved byte-identical (never dropped).
-                stack = deserializeSlot(e.getValue());
+                stack = ItemStack.deserializeBytes(e.getValue());
             } catch (Exception ex) {
                 next.put(e.getKey(), e.getValue());
                 continue;
