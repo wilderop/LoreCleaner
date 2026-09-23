@@ -1,3 +1,8 @@
+<!-- azpbmd-live -->
+**Live:** not installed
+
+This repository is the Paper plugin only. The Fabric mod is a separate project, [LoreCleanerFabric](https://github.com/wilderop/LoreCleanerFabric), and that jar is not loaded either. Survival still has the old LoreCleaner data folder. Survival and fabric load LorePunisher.
+<!-- /azpbmd-live -->
 # LoreCleaner
 
 Paper 26.2 plugin that automatically moves **lore items** from players who have been offline for 6+ months into barrels at their last logout location.
